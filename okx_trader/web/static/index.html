@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>okx-trader 委员会面板</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">okx-trader <span id="env-badge" class="badge"></span>
+    <span id="exec-badge" class="badge subtle"></span></div>
+  <nav id="tabs">
+    <a href="#/overview" data-tab="overview">总览</a>
+    <a href="#/equity" data-tab="equity">权益</a>
+    <a href="#/rounds" data-tab="rounds">决策历史</a>
+    <a href="#/trades" data-tab="trades">交易</a>
+    <a href="#/events" data-tab="events">事件</a>
+    <button id="pause-btn" class="ghost" title="暂停/恢复循环">⏸</button>
+    <button id="runnow-btn" class="ghost" title="立即跑一轮">▶ 立即一轮</button>
+    <button id="logout-btn" class="ghost" title="登出">退出</button>
+  </nav>
+</header>
+
+<main id="app">
+  <div class="card" style="max-width:420px;margin:60px auto">
+    <h2>登录</h2>
+    <form id="login-form">
+      <input type="password" id="login-password" placeholder="WEB_PASSWORD" autofocus>
+      <button type="submit">进入</button>
+      <div id="login-error" class="error"></div>
+    </form>
+  </div>
+</main>
+
+<footer>局域网明文 HTTP · 只读 + 暂停控制 · 无交易端点（设计约束，见 docs/dashboard.md）</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

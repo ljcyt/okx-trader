@@ -52,16 +52,57 @@ def cmd_run_once(args):
 
 
 def cmd_run_loop(args):
+    import threading
+
     from .config import get_logger
     from .loop import TradingLoop
+    from .web import server as web_server
+
     cfg = _build_cfg(args)
     executing = False if args.no_execute else None
     loop = TradingLoop(cfg=cfg, logger=get_logger(level=cfg.LOG_LEVEL),
                        executing=executing)
     if args.serve:
-        print("（--serve 将在 Phase 4 提供；当前仅运行交易循环）", file=sys.stderr)
+        web_server.check_bind_guard(cfg.WEB_HOST, cfg.WEB_PASSWORD)
+        app = web_server.create_app(cfg, loop.store, loop=loop)
+        t = threading.Thread(target=web_server.serve,
+                             args=(app, cfg.WEB_HOST, cfg.WEB_PORT),
+                             daemon=True, name="okxt-web")
+        t.start()
+        loop.log.info("Web 面板：http://%s:%d（局域网明文 HTTP，见 docs/dashboard.md）",
+                      cfg.WEB_HOST, cfg.WEB_PORT)
     loop.run(interval_sec=args.interval, max_rounds=args.max_rounds)
     return 0
+
+
+def cmd_serve(args):
+    """只读 serve：面板对 DB 只读；控制端点 409。"""
+    import threading
+
+    from .config import get_logger, load_config
+    from .store.db import Store
+    from .web import server as web_server
+
+    cfg = _build_cfg(args)
+    web_server.check_bind_guard(cfg.WEB_HOST, cfg.WEB_PASSWORD)
+    store = Store(web_server_store_path(cfg))
+    app = web_server.create_app(cfg, store, loop=None)
+    get_logger(level=cfg.LOG_LEVEL).info(
+        "Web 面板（只读）：http://%s:%d", cfg.WEB_HOST, cfg.WEB_PORT)
+    t = threading.Thread(target=web_server.serve,
+                         args=(app, cfg.WEB_HOST, cfg.WEB_PORT),
+                         daemon=True)
+    t.start()
+    try:
+        threading.Event().wait()  # 常驻
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+def web_server_store_path(cfg):
+    from .env import db_path
+    return db_path()
 
 
 def cmd_migrate(args):
@@ -131,6 +172,10 @@ def main(argv=None):
 
     p = sub.add_parser("check-env", help="环境自检（联网）")
     p.set_defaults(fn=cmd_check_env)
+
+    p = sub.add_parser("serve", help="只读 Web 面板（循环跑在别处时用）")
+    p.add_argument("--env", choices=["replay", "paper", "demo"])
+    p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("replay", help="脚本化回放（全离线）")
     p.add_argument("--env", choices=["replay"], default="replay")

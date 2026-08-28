@@ -14,6 +14,7 @@
 状态说明：env.name 决定环境；--no-execute 只把 executing 压成 False，
 demo 环境可以"只观察"，不需要发明第五种环境。
 """
+import threading
 import time
 import traceback
 
@@ -72,6 +73,12 @@ class TradingLoop:
                                    env=self.env.name)
         self.round_seq = 0
         self.paused = False
+        self.last_snapshot = None       # Web 面板读的活状态
+        self.next_round_ts = None
+        self.last_round_id = None
+        self.current_step = None
+        self._busy = False
+        self._run_now = threading.Event()
         w.write_event(self.store, self.env.name, "env_switch",
                       f"启动：env={self.env.name} executing={self.executing} "
                       f"v{__version__}", level="info")
@@ -85,6 +92,18 @@ class TradingLoop:
         import os
         init_db(p)
         return p
+
+    # ── 面板控制（认证后可暂停/触发，但永远不能交易）─────────────────
+
+    def request_run_now(self):
+        self._run_now.set()
+
+    def set_paused(self, paused):
+        self.paused = bool(paused)
+        w.write_event(self.store, self.env.name,
+                      "paused" if paused else "resumed",
+                      "循环已暂停" if paused else "循环已恢复",
+                      level="info")
 
     # ────────────────────────── 快照 ──────────────────────────
 
@@ -110,6 +129,11 @@ class TradingLoop:
         self.log.info("快照：权益 %.2f U，高水位 %.2f，回撤 %.2f%%，持仓 %d 个，因子 %d/%d",
                       equity, hwm, drawdown * 100, len(positions),
                       symbols_ok, symbols_total)
+        self.last_snapshot = {
+            "equity": equity, "hwm": hwm, "drawdown": drawdown,
+            "usdt_avail": equity_info["usdt_avail"], "positions": positions,
+            "data_ok": symbols_ok > 0, "symbols_ok": symbols_ok,
+            "symbols_total": symbols_total}
         for inst_id, f in factors.items():
             if f:
                 self.log.info("因子：%s", format_factor_report(f).replace("\n", " | "))
@@ -144,6 +168,8 @@ class TradingLoop:
 
         out = {"round_id": round_id, "status": "error", "env": self.env.name,
                "executing": self.executing}
+        self.last_round_id = round_id
+        self._busy = True
         try:
             # 1. 快照
             snap = self.take_snapshot()
@@ -242,6 +268,8 @@ class TradingLoop:
                 pass
             out["status"] = "error"
             out["error"] = str(e)
+        finally:
+            self._busy = False
         return out
 
     @staticmethod
@@ -506,7 +534,9 @@ class TradingLoop:
                     time.sleep(2)
                     continue
                 n += 1
+                self.current_step = "running"
                 result = self.run_round()
+                self.current_step = None
                 if on_round:
                     try:
                         on_round(result)
@@ -514,10 +544,16 @@ class TradingLoop:
                         self.log.debug("on_round 回调失败", exc_info=True)
                 if max_rounds is not None and n >= max_rounds:
                     break
-                # 分片睡眠，暂停能尽快生效
+                self.next_round_ts = time.time() + interval
+                # 分片睡眠：暂停与 run-now 都能尽快生效
                 slept = 0
                 while slept < interval and not self.paused:
-                    time.sleep(min(5, interval - slept))
-                    slept += min(5, interval - slept)
+                    if self._run_now.is_set():
+                        self._run_now.clear()
+                        break
+                    chunk = min(5, interval - slept)
+                    time.sleep(chunk)
+                    slept += chunk
+                self.next_round_ts = None
         except KeyboardInterrupt:
             self.log.info("收到中断，交易循环停止")
