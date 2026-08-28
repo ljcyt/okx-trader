@@ -10,7 +10,16 @@
     资金：资金费率
     形态：最后一根 K 线的简单形态分类
 """
+import re
 import time
+
+
+def _bar_seconds(bar):
+    """"1H"/"15m"/"4D" 之类的周期串 → 秒数；不认识返回 None。"""
+    m = re.match(r"^(\d+)([mHdD])$", str(bar))
+    if not m:
+        return None
+    return int(m.group(1)) * {"m": 60, "H": 3600, "D": 86400}[m.group(2)]
 
 
 def ema(values, period):
@@ -264,6 +273,15 @@ def build_factor_report(cfg, client, inst_id):
     candles = client.get_candles(inst_id, bar=bar, limit=80)
     if len(candles) < 60:
         raise ValueError(f"{inst_id} K 线数量不足（{len(candles)} 根），无法计算因子")
+    # 过期数据守卫：最新已收盘 K 线比 2×bar 还旧，说明行情断流或时钟异常——
+    # 静默拿过期数据算因子比直接报错更糟
+    bar_sec = _bar_seconds(bar)
+    if bar_sec and candles:
+        stale_ms = time.time() * 1000 - candles[-1]["ts"]
+        if stale_ms > 2 * bar_sec * 1000:
+            raise ValueError(
+                f"{inst_id} 最新已收盘K线已过期 {stale_ms / 60000:.0f} 分钟"
+                f"（阈值 2×{bar}），数据疑似断流")
     closes = [c["close"] for c in candles]
     price = closes[-1]
 

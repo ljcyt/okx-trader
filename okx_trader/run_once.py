@@ -5,6 +5,7 @@
     python okx_trader/run_once.py
 
 跑一轮完整闭环：快照+因子 → 委员会(3分析师+3裁判) → 硬风控 → （纸面/真实）执行 → 落盘记录。
+（single 单Planner模式已删除，决策一律走委员会）
 """
 import sys
 import os
@@ -36,8 +37,6 @@ def main():
     if status == "risk_rejected":
         for f in record.get("risk", {}).get("failures", []):
             print(f"  风控拒绝：{f}")
-    elif status == "critic_rejected":
-        print(f"  Critic 意见：{record.get('critic', {}).get('concerns')}")
     elif status == "dry_run_planned":
         w = record.get("execution", {}).get("would", {})
         print(f"  【纸面】将挂 {w.get('direction')} 限价单 {w.get('contracts')} 张 @ {w.get('maker_px')}，"

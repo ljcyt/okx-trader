@@ -111,24 +111,26 @@ BAR_SECONDS = {
 class OKXDemoClient:
     """OKX 模拟盘客户端。tdMode 固定用 cross（全仓），简单可靠。"""
 
-    def __init__(self, cfg=None, logger=None):
+    def __init__(self, cfg=None, logger=None, api_key=None, api_secret_key=None,
+                 passphrase=None, proxy=None):
         from okx import Account, MarketData, PublicData, Trade  # 延迟导入，方便单元测试
 
         self.cfg = cfg or load_config()
         self.log = logger or get_logger(level=getattr(self.cfg, "LOG_LEVEL", "INFO"))
-        proxy = getattr(self.cfg, "OKX_PROXY", "") or None
+        # 显式传入的凭证优先于配置文件（PaperClient 传 "-1" 表示不签名，且不改写 cfg）
+        api_key = api_key if api_key is not None else self.cfg.OKX_API_KEY
+        api_secret_key = (api_secret_key if api_secret_key is not None
+                          else self.cfg.OKX_SECRET_KEY)
+        passphrase = passphrase if passphrase is not None else self.cfg.OKX_PASSPHRASE
+        proxy = proxy if proxy is not None else (getattr(self.cfg, "OKX_PROXY", "") or None)
 
         common = dict(flag=str(self.cfg.OKX_FLAG), proxy=proxy, debug=False)
         self.account = Account.AccountAPI(
-            api_key=self.cfg.OKX_API_KEY,
-            api_secret_key=self.cfg.OKX_SECRET_KEY,
-            passphrase=self.cfg.OKX_PASSPHRASE,
+            api_key=api_key, api_secret_key=api_secret_key, passphrase=passphrase,
             **common,
         )
         self.trade = Trade.TradeAPI(
-            api_key=self.cfg.OKX_API_KEY,
-            api_secret_key=self.cfg.OKX_SECRET_KEY,
-            passphrase=self.cfg.OKX_PASSPHRASE,
+            api_key=api_key, api_secret_key=api_secret_key, passphrase=passphrase,
             **common,
         )
         # 公开行情不需要签名，但传 flag 保证行为一致
@@ -374,25 +376,48 @@ class OKXDemoClient:
         """
         resp = self._call("get_candles", self.market.get_candlesticks,
                           inst_id, bar=bar, limit=str(limit))
-        rows = resp.get("data", [])
-        # OKX 返回按时间倒序（最新在前），反转成升序
-        rows = list(reversed(rows))
-        candles = [{
+        rows = list(reversed(resp.get("data", [])))  # OKX 倒序 → 升序
+        rows, dropped = self._clean_candle_rows(rows, bar)
+        if dropped:
+            self.log.debug("get_candles %s %s：丢弃 %d 根未收盘K线", inst_id, bar, dropped)
+        return [{
             "ts": int(r[0]),
             "open": float(r[1]), "high": float(r[2]),
             "low": float(r[3]), "close": float(r[4]),
             "vol": float(r[5]),
         } for r in rows]
-        # 丢掉进行中的半根 K 线：OKX 的最后一根是当前未收盘 K 线，
-        # 混进去会污染 RSI/ATR/量比/形态等所有基于收盘数据的因子
-        sec = BAR_SECONDS.get(bar)
-        if sec and candles and time.time() * 1000 - candles[-1]["ts"] < sec * 1000:
-            candles = candles[:-1]
-        return candles
+
+    @staticmethod
+    def _clean_candle_rows(rows, bar, now_ms=None):
+        """过滤未收盘 K 线（rows 为时间升序的原始响应行）。
+
+        主判据：OKX 行下标 8 是 confirm（"1" 已收盘 / "0" 进行中）；
+        响应缺 confirm 列时退回时间戳启发式（时钟偏移下可能误判，仅兜底）。
+        未收盘的半根 K 线混进 RSI/ATR/量比/形态会污染所有基于收盘数据的因子。
+        返回 (cleaned_rows, dropped_count)。
+        """
+        if now_ms is None:
+            now_ms = time.time() * 1000
+        cleaned, dropped = [], 0
+        if rows and len(rows[0]) > 8:  # 有 confirm 列
+            for r in rows:
+                if str(r[8]) == "1":
+                    cleaned.append(r)
+                else:
+                    dropped += 1
+        else:  # 无 confirm 列：时间戳启发式兜底
+            sec = BAR_SECONDS.get(bar)
+            cleaned = list(rows)
+            if sec:
+                while cleaned and now_ms - int(cleaned[-1][0]) < sec * 1000:
+                    cleaned.pop()
+                    dropped += 1
+        return cleaned, dropped
 
     def compute_atr(self, inst_id, period=14, bar="1H"):
-        """简单 ATR（Wilder 平滑近似）：用在波动率目标仓位计算。"""
-        candles = self.get_candles(inst_id, bar=bar, limit=period + 1)
+        """简单 ATR（周期 TR 均值）：用在波动率目标仓位计算。
+        请求 period+2 根：丢掉未收盘那根后仍剩 period+1 根 → 正好 period 个 TR。"""
+        candles = self.get_candles(inst_id, bar=bar, limit=period + 2)
         if len(candles) < 2:
             raise OKXAPIError("DATA", f"{inst_id} K 线不足，无法计算 ATR")
         trs = []
@@ -629,18 +654,34 @@ class OKXDemoClient:
         return resp["data"][0]["algoId"]
 
     def get_pending_stop_losses(self, inst_id=""):
-        """挂着的止损单（conditional）。"""
-        resp = self._call("order_algos_list", self.trade.order_algos_list,
-                          ordType="conditional", instType="SWAP", instId=inst_id)
-        return [{
-            "instId": d["instId"],
-            "algoId": d["algoId"],
-            "state": d.get("algoState", d.get("state", "")),
-            "side": d.get("side"),
-            "sz": d.get("sz"),
-            "sl_trigger_px": float(d["slTriggerPx"]) if d.get("slTriggerPx") else None,
-            "cxlOnClosePos": d.get("cxlOnClosePos", ""),
-        } for d in resp.get("data", [])]
+        """挂着的保护单：conditional（纯止损）与 oco（止盈+止损）都要查并合并——
+        python-okx 的 order_algos_list 一次只接受一个 ordType，所以是两次调用。
+        漏查 oco 会让带止盈的仓位在巡检眼里永远"裸仓"，每轮叠加一张止损单。"""
+        out = []
+        for ord_type in ("conditional", "oco"):
+            resp = self._call("order_algos_list", self.trade.order_algos_list,
+                              ordType=ord_type, instType="SWAP", instId=inst_id)
+            for d in resp.get("data", []):
+                out.append({
+                    "instId": d["instId"],
+                    "algoId": d["algoId"],
+                    "ord_type": ord_type,
+                    "state": d.get("algoState", d.get("state", "")),
+                    "side": d.get("side"),
+                    "sz": d.get("sz"),
+                    "sl_trigger_px": (float(d["slTriggerPx"])
+                                      if d.get("slTriggerPx") else None),
+                    "tp_trigger_px": (float(d["tpTriggerPx"])
+                                      if d.get("tpTriggerPx") else None),
+                    "cxlOnClosePos": d.get("cxlOnClosePos", ""),
+                })
+        return out
+
+    def get_algo_order_details(self, algo_id):
+        """查询单个策略委托单的当前状态（巡检对账用：交易所查不到时先对账再补挂）。"""
+        resp = self._call("get_algo_order_details", self.trade.get_algo_order_details,
+                          algoId=str(algo_id))
+        return resp["data"][0] if resp.get("data") else None
 
     def cancel_stop_loss(self, inst_id, algo_id):
         """撤销止损单。cancel_algo_order 的入参是 list[dict]（支持批量），这里单笔。"""

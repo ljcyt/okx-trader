@@ -4,7 +4,6 @@
 每轮流程（1H K线，默认每小时一轮）：
     1. 快照：账户权益 + 持仓 + 各标的行情与因子报告（factors.py 代码计算）
     2. 委员会决策（committee.py）：3 分析师提案 → 3 裁判打分 → 聚合胜出
-       （DECISION_MODE="single" 时退回单 Planner + 单 Critic 模式）
     3. 硬风控终审（risk.py 一票否决，AI 不可越过）
     4. 执行：
        - DRY_RUN=True：纸面模拟——记录"将挂什么单/挂什么止损"，不碰交易所
@@ -28,9 +27,7 @@ import traceback
 
 from client import OKXDemoClient, OKXAPIError, load_config, get_logger
 from committee import Committee
-from critic import Critic
 from factors import build_factor_report, format_factor_report
-from planner import Planner
 from risk import RiskManager
 from state import StateStore
 
@@ -46,9 +43,10 @@ class PaperOKXClient(OKXDemoClient):
     账户状态用本地虚拟数据（不调任何需要鉴权的接口）。"""
 
     def __init__(self, cfg, logger=None):
-        # python-okx 约定 api_key='-1' 表示不签名（纯公开访问）
-        cfg.OKX_API_KEY, cfg.OKX_SECRET_KEY, cfg.OKX_PASSPHRASE = "-1", "-1", "-1"
-        super().__init__(cfg, logger=logger)
+        # "-1" 是 python-okx 约定的不签名标记。显式传参而不是改写 cfg——
+        # 就地改写会把共享 cfg 对象里的真实密钥抹掉，影响其他客户端
+        super().__init__(cfg, logger=logger,
+                         api_key="-1", api_secret_key="-1", passphrase="-1")
         self.paper_equity = float(getattr(cfg, "PAPER_EQUITY", 10000.0))
 
     def get_equity(self):
@@ -57,6 +55,9 @@ class PaperOKXClient(OKXDemoClient):
 
     def get_positions(self, inst_id=""):
         return []
+
+    def get_pending_orders(self, inst_id=""):
+        return []  # 纸面从不持有真实挂单（风控 R4 查重用）
 
     def set_leverage(self, inst_id, lever):
         self.log.info("（纸面）set_leverage %s %sx", inst_id, lever)
@@ -92,12 +93,7 @@ class TradingLoop:
 
         self.state = StateStore(mode="paper" if not self.creds_ok else "live")
         self.risk = RiskManager(self.cfg, self.client, self.state)
-        self.decision_mode = str(getattr(self.cfg, "DECISION_MODE", "committee")).lower()
-        if self.decision_mode == "committee":
-            self.committee = Committee(self.cfg, self.client)
-        else:
-            self.planner = Planner(self.cfg, self.client)
-            self.critic = Critic(self.cfg, self.client)
+        self.committee = Committee(self.cfg, self.client)
         self.round_seq = 0
 
     # ────────────────────────── 快照 ──────────────────────────
@@ -110,13 +106,18 @@ class TradingLoop:
         positions = self.client.get_positions()
 
         factors = {}
+        factor_errors = {}
         for inst_id in self.cfg.SYMBOLS:
             try:
                 factors[inst_id] = build_factor_report(self.cfg, self.client, inst_id)
             except Exception as e:  # noqa: BLE001
+                # 单标的失败记入 factor_errors——"没数据"绝不能伪装成"没信号"
                 self.log.warning("%s 因子计算失败：%s", inst_id, e)
                 factors[inst_id] = None
+                factor_errors[inst_id] = f"{type(e).__name__}: {e}"
 
+        symbols_total = len(self.cfg.SYMBOLS)
+        symbols_ok = sum(1 for f in factors.values() if f is not None)
         snapshot = {
             "ts": time.time(),
             "equity": equity,
@@ -125,10 +126,14 @@ class TradingLoop:
             "drawdown": drawdown,
             "positions": positions,
             "factors": factors,
+            "factor_errors": factor_errors,
+            "data_ok": symbols_ok > 0,
+            "symbols_ok": symbols_ok,
+            "symbols_total": symbols_total,
         }
-        self.log.info("快照：权益 %.2f U（%s），高水位 %.2f，回撤 %.2f%%，持仓 %d 个",
+        self.log.info("快照：权益 %.2f U（%s），高水位 %.2f，回撤 %.2f%%，持仓 %d 个，因子 %d/%d",
                       equity, "真实" if self.creds_ok else "纸面",
-                      hwm, drawdown * 100, len(positions))
+                      hwm, drawdown * 100, len(positions), symbols_ok, symbols_total)
         for inst_id, f in factors.items():
             if f:
                 self.log.info("因子：%s", format_factor_report(f).replace("\n", " | "))
@@ -171,16 +176,30 @@ class TradingLoop:
         except OKXAPIError as e:
             self.log.warning("巡检：读取挂单失败：%s", e)
 
-        # 止损缺失的持仓：立即补挂
+        # 止损缺失检测：交易所列表（conditional+oco 合并）为空时，先用元数据里的
+        # algo_id 对账（防瞬时查询异常误判裸仓），确认没了才补挂；
+        # 补挂时透传 meta 里的 target，避免把 OCO 静默降级成纯止损
         for inst_id, p in live.items():
             try:
                 existing = self.client.get_pending_stop_losses(inst_id)
             except OKXAPIError as e:
-                self.log.error("巡检：读取 %s 保护单失败：%s", inst_id, e)
+                self.log.error("巡检：读取 %s 保护单失败（不据此判定裸仓）：%s", inst_id, e)
                 continue
             if existing:
                 continue
-            stop = (meta.get(inst_id) or {}).get("stop")
+            m = meta.get(inst_id) or {}
+            recorded_algo = m.get("algo_id")
+            if recorded_algo:
+                try:
+                    d = self.client.get_algo_order_details(recorded_algo)
+                    if d and str(d.get("state")) in ("live", "effective", "running", "pause"):
+                        self.log.info("巡检：%s 列表为空但 algoId=%s 状态=%s 仍有效，不重复补挂",
+                                      inst_id, recorded_algo, d.get("state"))
+                        continue
+                except OKXAPIError as e:
+                    self.log.warning("巡检：%s 对账 algoId=%s 失败（%s），按缺失处理",
+                                     inst_id, recorded_algo, e)
+            stop = m.get("stop")
             if not stop:
                 atr = ((snap.get("factors") or {}).get(inst_id) or {}).get("atr")
                 if not atr:
@@ -188,12 +207,20 @@ class TradingLoop:
                     continue
                 stop = (p["avg_px"] - 1.5 * atr if p["direction"] == "long"
                         else p["avg_px"] + 1.5 * atr)
+            tp = m.get("target")
             try:
-                self.client.place_stop_loss(inst_id, p["direction"], p["contracts"], stop)
-                self.log.warning("巡检：%s 保护单缺失，已按 %.4g 补挂 %s 止损",
-                                 inst_id, stop, p["direction"])
+                algo_id = self.client.place_stop_loss(inst_id, p["direction"],
+                                                      p["contracts"], stop, tp_px=tp)
+                meta[inst_id] = {**m, "algo_id": algo_id, "stop": stop, "target": tp}
+                changed = True
+                self.log.warning("巡检：%s 保护单缺失，已补挂 %s 止损@%.4g%s",
+                                 inst_id, p["direction"], stop,
+                                 f" 止盈@{tp:.4g}" if tp else "")
             except OKXAPIError as e:
-                self.log.error("巡检：%s 补挂止损失败：%s —— 该仓位当前无保护，请人工处理！", inst_id, e)
+                self.log.error("巡检：%s 补挂止损失败：%s —— 该仓位当前无保护，请人工处理！",
+                               inst_id, e)
+        if changed:
+            self.state.set_positions_meta(meta)
 
     # ────────────────────────── 单轮 ──────────────────────────
 
@@ -222,31 +249,30 @@ class TradingLoop:
                     if f else None)
                 for k, f in snap["factors"].items()
             }
+            record["data_ok"] = snap["data_ok"]
+            record["symbols_ok"] = snap["symbols_ok"]
+            record["symbols_total"] = snap["symbols_total"]
 
-            # 2. 决策：委员会 或 单Planner
-            if self.decision_mode == "committee":
-                decision = self.committee.decide(snap)
-                record["committee"] = decision
-                plan = decision.get("plan") if decision.get("action") == "open" else None
-                if plan is None:
-                    record["status"] = "no_action"
-                    record["decision_reason"] = decision.get("reason")
-                    record["duration_sec"] = round(time.time() - t0, 2)
-                    return self._save_round(record)
-            else:
-                plan = self.planner.decide(snap)
-                record["planner"] = plan
-                if plan.get("action") != "open":
-                    record["status"] = "no_action"
-                    record["duration_sec"] = round(time.time() - t0, 2)
-                    return self._save_round(record)
-                review = self.critic.review(plan, snap)
-                record["critic"] = review
-                if not review.get("approved"):
-                    record["status"] = "critic_rejected"
-                    record["duration_sec"] = round(time.time() - t0, 2)
-                    self.log.info("Critic 否决：%s", review.get("concerns"))
-                    return self._save_round(record)
+            # 数据降级短路：全部标的因子失败 → 不跑委员会。
+            # 跑了只会制造"所有分析师都弃权"的误导性记录——没数据 ≠ 没信号。
+            if not snap["data_ok"]:
+                record["status"] = "data_unavailable"
+                record["decision_reason"] = "全部标的因子获取失败，本轮不跑委员会"
+                record["factor_errors"] = snap["factor_errors"]
+                self.log.error("数据降级：%s —— 本轮记为 data_unavailable，不跑委员会",
+                               snap["factor_errors"])
+                record["duration_sec"] = round(time.time() - t0, 2)
+                return self._save_round(record)
+
+            # 2. 委员会决策
+            decision = self.committee.decide(snap)
+            record["committee"] = decision
+            plan = decision.get("plan") if decision.get("action") == "open" else None
+            if plan is None:
+                record["status"] = "no_action"
+                record["decision_reason"] = decision.get("reason")
+                record["duration_sec"] = round(time.time() - t0, 2)
+                return self._save_round(record)
 
             # 3. 硬风控终审
             verdict = self.risk.check_open_plan(plan)
@@ -385,6 +411,7 @@ class TradingLoop:
             meta[inst_id] = {
                 "direction": direction, "stop": stop, "target": tp,
                 "contracts": filled, "opened_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "algo_id": execution.get("stop_algo_id"),
             }
             self.state.set_positions_meta(meta)
         return execution

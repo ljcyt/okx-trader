@@ -123,6 +123,13 @@ class RiskManager:
             v.fail(f"R1: 多仓止损价 {stop} 必须低于参考入场价 {entry_ref}")
         if direction == "short" and stop <= entry_ref:
             v.fail(f"R1: 空仓止损价 {stop} 必须高于参考入场价 {entry_ref}")
+        # 计划过期守卫：提案基于已收盘K线，快照到执行之间行情可能穿过止损价——
+        # 现价已经不满足止损方向时，这笔交易天然不合理（开仓即浮亏、止损秒触发）
+        live_last = ticker["last"]
+        if direction == "long" and live_last <= stop:
+            v.fail(f"R1: 现价 {live_last} 已不高于止损价 {stop}——计划过期，拒绝")
+        if direction == "short" and live_last >= stop:
+            v.fail(f"R1: 现价 {live_last} 已不低于止损价 {stop}——计划过期，拒绝")
 
         # ── R2 止损距离 ──
         stop_dist = abs(entry_ref - stop)
@@ -144,18 +151,31 @@ class RiskManager:
         if same_pos:
             v.fail(f"R4: {inst_id} 已有持仓（{same_pos[0]['direction']} "
                    f"{same_pos[0]['contracts']} 张），当前版本不允许加仓")
+        # 挂着的入场单也算暴露：已有未成交挂单时不重复提交
+        # （真实环境查交易所；paper/replay 的 client 返回各自维护的挂单）
+        try:
+            pending_entries = self.client.get_pending_orders(inst_id)
+        except OKXAPIError:
+            pending_entries = []
+        if pending_entries:
+            v.fail(f"R4: {inst_id} 已有未成交的入场挂单"
+                   f"（ordId={pending_entries[0].get('ordId', '?')}），不重复提交")
 
         if len(positions) >= self.cfg.MAX_OPEN_POSITIONS:
             v.fail(f"R4: 持仓数量已达上限 {self.cfg.MAX_OPEN_POSITIONS}，禁止再开")
 
         # ── R3 波动率目标仓位计算 ──
         if v.passed:
-            try:
-                atr = self.client.compute_atr(
-                    inst_id, period=self.cfg.ATR_PERIOD, bar=self.cfg.ATR_BAR
-                )
-            except OKXAPIError as e:
-                return v.fail(f"R3: 无法计算 ATR：{e}")
+            # ATR 单一来源：优先用委员会看过的那份（plan.factors.atr），
+            # 缺失时才自己去拉——两个 ATR 口径不一致会让风控按没见过的数字定仓位
+            atr = (plan.get("factors") or {}).get("atr")
+            if not atr:
+                try:
+                    atr = self.client.compute_atr(
+                        inst_id, period=self.cfg.ATR_PERIOD, bar=self.cfg.ATR_BAR
+                    )
+                except OKXAPIError as e:
+                    return v.fail(f"R3: 无法计算 ATR：{e}")
 
             atr_dist = self.cfg.ATR_STOP_MULT * atr
             # 有效止损距离取「计划距离」与「ATR 距离」的较大者：
@@ -215,29 +235,47 @@ class RiskManager:
                 f"{risk_pct:.2%}，加仓后总杠杆 {leverage_after:.2f}x，ATR={atr:.1f}）"
             )
 
-            # ── R7 盈亏比检查（借鉴调研中的 Risk Manager 实践：RR ≥ 1.5 才出手）──
-            # 目标空间：优先用最近的逆向结构位（做多看阻力、做空看支撑），
-            # 没有结构位时用 2.5×ATR 作为默认目标。因子快照由委员会附在 plan["factors"]。
+            # ── R7 盈亏比检查（RR ≥ MIN_RR 才出手；无条件执行，永远算出 target/rr）──
+            # 目标选择：按距离升序找"最近的、值得去的"结构位——
+            #   1) 距入场 < MIN_TARGET_ATR×ATR 的位直接过滤（贴脸的位是噪声，不是目标；
+            #      旧逻辑取"最近位"曾被 0.41×ATR 外的贴脸阻力以 RR=0.31 否决过本可通过的交易）
+            #   2) 取第一个 RR 达标的位（一个近位不再否决有远位支撑的交易）
+            #   3) 都没有 → TARGET_ATR_MULT×ATR 兜底（target_source='atr_multiple'），
+            #      突破单在结构位方向没有位时也逃不过 RR 检查
             factor_snap = plan.get("factors") or {}
             sr = factor_snap.get("sr") or {}
             atr_val = v.sized.get("atr")
-            if atr_val and (sr.get("resistances") or sr.get("supports")):
-                if direction == "long":
-                    ups = [x for x in sr.get("resistances", []) if x > entry_ref]
-                    target = min(ups) if ups else entry_ref + 2.5 * atr_val
-                else:
-                    downs = [x for x in sr.get("supports", []) if x < entry_ref]
-                    target = max(downs) if downs else entry_ref - 2.5 * atr_val
+            if not atr_val:
+                v.warn("R7 跳过：无 ATR（不该发生，因子快照缺失）")
+            else:
+                sign = 1 if direction == "long" else -1
+                levels = [x for x in (sr.get("resistances", []) if direction == "long"
+                                      else sr.get("supports", []))
+                          if sign * (x - entry_ref) > 0]
+                levels.sort(key=lambda x: abs(x - entry_ref))
+                min_target_dist = self.cfg.MIN_TARGET_ATR * atr_val
+                target, target_source = None, None
+                for lv in levels:
+                    dist = abs(lv - entry_ref)
+                    if dist < min_target_dist:
+                        continue
+                    if dist / stop_dist >= self.cfg.MIN_RR:
+                        target, target_source = lv, "structure"
+                        break
+                if target is None:
+                    target = entry_ref + sign * self.cfg.TARGET_ATR_MULT * atr_val
+                    target_source = "atr_multiple"
                 rr = abs(target - entry_ref) / stop_dist
                 if rr < self.cfg.MIN_RR:
                     v.fail(
-                        f"R7: 盈亏比不足——目标 {target:.4g}（结构位），止损距离 "
-                        f"{stop_dist:.4g}，RR={rr:.2f} < {self.cfg.MIN_RR}"
+                        f"R7: 盈亏比不足——目标 {target:.4g}（{target_source}），"
+                        f"止损距离 {stop_dist:.4g}，RR={rr:.2f} < {self.cfg.MIN_RR}"
                     )
                 else:
                     v.sized["target"] = round(target, 6)
+                    v.sized["target_source"] = target_source
                     v.sized["rr"] = round(rr, 2)
-                    v.warn(f"盈亏比 RR={rr:.2f}（目标 {target:.4g}）")
+                    v.warn(f"盈亏比 RR={rr:.2f}（目标 {target:.4g}，来源 {target_source}）")
 
         self.log.info(
             "风控审查 %s %s：%s（%.0fms）",

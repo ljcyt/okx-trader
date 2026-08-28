@@ -45,7 +45,9 @@ ATR_BAR = "1H"                # ATR 使用的 K 线周期
 ATR_STOP_MULT = 1.5           # 止损距离下限 = 1.5 × ATR（防止止损太近被噪声扫掉）
 MIN_STOP_DIST_PCT = 0.002     # 止损距离相对入场价的最小比例（0.2%）
 MAX_STOP_DIST_PCT = 0.05      # 止损距离相对入场价的最大比例（5%，太远视为风险失控）
-MIN_RR = 1.5                  # 盈亏比下限：目标空间（最近结构位或2.5×ATR）/ 止损距离
+MIN_RR = 1.5                  # 盈亏比下限：目标空间 / 止损距离
+MIN_TARGET_ATR = 0.5          # 结构位距入场至少 0.5×ATR 才算目标（贴脸的位是噪声不是目标）
+TARGET_ATR_MULT = 2.5         # 无可用结构位时的 ATR 兜底目标倍数
 
 # 杠杆
 LEVERAGE = 3                  # 单合约杠杆（开仓前自动设置；总杠杆另受 MAX_TOTAL_LEVERAGE 约束）
@@ -57,9 +59,6 @@ DRY_RUN = True
 PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 
 # ── 决策模式（第四步/多agent委员会）──────────────────────────────────────────
-# committee = 多agent委员会：3个 Analyst 提案 + 3个 Judge 打分，胜出才交易
-# single    = 单 Planner 生成 + 单 Critic 审查（简化模式）
-DECISION_MODE = "committee"
 SCORE_THRESHOLD = 6.5         # Judge 平均分 ≥ 此值 且 多数通过，提案才胜出
 LOOP_INTERVAL_SEC = 3600      # 交易循环每轮间隔（秒）—— 建议≈K线周期（1H）
 
