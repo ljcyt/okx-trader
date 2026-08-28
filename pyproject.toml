@@ -38,6 +38,10 @@ all-frontends = [
     "wecom-aibot-sdk>=1.0",
     "dingtalk-stream>=0.20",
 ]
+# OKX 模拟盘交易循环（okx_trader/）专用，按需安装：pip install .[okx-trader]
+okx-trader = [
+    "python-okx>=0.4.3,<0.5",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

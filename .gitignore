@@ -156,3 +156,8 @@ frontends/conductor_im_plugins/*
 
 # Beta 渠道：订阅门户插件（仅 beta 分发携带，不入库）
 plugins/subscription_portal.py
+
+# OKX trader（模拟盘自主交易）：密钥与运行数据不入库
+okx_trader/okx_config.py
+okx_trader/logs/
+okx_trader/data/
