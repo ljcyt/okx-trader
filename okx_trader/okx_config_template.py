@@ -35,7 +35,9 @@ SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 
 # 全账户风控上限（由 okx_trader/risk.py 用代码强制执行，见第三步）
 MAX_RISK_PER_TRADE = 0.01     # 单笔最大亏损 ≤ 账户权益的 1%
-MAX_TOTAL_LEVERAGE = 3.0      # 总杠杆上限：全部仓位名义市值之和 / 账户权益
+MAX_TOTAL_LEVERAGE = 3
+TRAIL_ATR_MULT = 1.0          # 移动止损：跟在价格极值后 1×ATR（浮盈 1R 前先推保本）
+MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓.0      # 总杠杆上限：全部仓位名义市值之和 / 账户权益
 MAX_OPEN_POSITIONS = 3        # 最多同时持有的仓位数量
 MAX_DRAWDOWN = 0.10           # 回撤熔断：权益自历史高点回撤超过 10% 禁止开新仓
 
@@ -54,7 +56,9 @@ MIN_TARGET_ATR = 0.5          # 结构位距入场至少 0.5×ATR 才算目标�
 TARGET_ATR_MULT = 2.5         # 无可用结构位时的 ATR 兜底目标倍数
 
 # 杠杆
-LEVERAGE = 3                  # 单合约杠杆（开仓前自动设置；总杠杆另受 MAX_TOTAL_LEVERAGE 约束）
+LEVERAGE = 3
+TRAIL_ATR_MULT = 1.0          # 移动止损：跟在价格极值后 1×ATR（浮盈 1R 前先推保本）
+MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓                  # 单合约杠杆（开仓前自动设置；总杠杆另受 MAX_TOTAL_LEVERAGE 约束）
 
 PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 

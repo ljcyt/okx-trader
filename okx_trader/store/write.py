@@ -171,8 +171,8 @@ class RoundWriter:
             "INSERT INTO orders(round_pk, trade_pk, env, inst_id, kind, ord_type, "
             "exch_ord_id, exch_algo_id, cl_ord_id, side, pos_side, px, sz, "
             "sl_trigger_px, tp_trigger_px, state, filled_sz, avg_px, created_ts, "
-            "updated_ts, note, raw_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,"
-            "?,?,?,?,?)",
+            "updated_ts, note, raw_json) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.pk, trade_pk, env, inst_id, kind, ord_type, exch_ord_id,
              exch_algo_id, cl_ord_id, side, pos_side, px, sz, sl_trigger_px,
              tp_trigger_px, state, filled_sz, avg_px, time.time(), time.time(),

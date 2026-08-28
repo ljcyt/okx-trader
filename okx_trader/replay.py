@@ -251,6 +251,10 @@ class ReplayClient:
     def get_algo_order_details(self, algo_id):
         return self.algos.get(str(algo_id))
 
+    def cancel_stop_loss(self, inst_id, algo_id):
+        if str(algo_id) in self.algos:
+            self.algos[str(algo_id)]["state"] = "canceled"
+
     def close_position_market(self, inst_id, direction=""):
         if inst_id in self.positions:
             self._close(inst_id, self._last_close() or 0, "manual")

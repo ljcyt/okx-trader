@@ -19,6 +19,7 @@ import traceback
 
 from . import __version__
 from .committee import Committee
+from .exits import manage_open_positions, open_trade_row, reconcile_closed_trade
 from .env import ENVS, db_path, make_client, resolve_env
 from .factors import build_factor_report, format_factor_report
 from .risk import RiskManager
@@ -146,8 +147,9 @@ class TradingLoop:
         try:
             # 1. 快照
             snap = self.take_snapshot()
-            # 2. 持仓巡检/对账
+            # 2. 持仓巡检/对账 + 退出管理（移动/时间止损）
             self._patrol_positions(snap, rw)
+            manage_open_positions(self, snap, rw)
             # 因子快照全量入库
             for inst_id, f in snap["factors"].items():
                 rw.write_factors(
@@ -263,9 +265,8 @@ class TradingLoop:
         changed = False
         for inst_id in list(meta.keys()):
             if inst_id not in live:
-                self.log.info("巡检：%s 仓位已离场，清理元数据（出场细节由成交对账回填）",
-                              inst_id)
-                meta.pop(inst_id)
+                self.log.info("巡检：%s 仓位已离场，回填交易记录并清理元数据", inst_id)
+                reconcile_closed_trade(self, snap, rw, inst_id, meta)
                 changed = True
 
         if not self.executing:
@@ -439,6 +440,9 @@ class TradingLoop:
         execution["status"] = self._attach_protect(inst_id, direction, filled,
                                                    stop, tp, execution, rw)
         if execution["status"] == "opened":
+            trade_pk = open_trade_row(self, rw, sized, filled,
+                                      order["avg_px"] or sized.get("entry_ref"))
+            execution["trade_pk"] = trade_pk
             meta = self.risk.state.get_positions_meta()
             meta[inst_id] = {
                 "direction": direction, "stop": stop, "target": tp,
@@ -447,7 +451,7 @@ class TradingLoop:
                 "algo_id": execution.get("stop_algo_id"),
                 "analyst": sized.get("analyst"),
                 "committee_score": sized.get("committee_score"),
-                "round_id": execution.get("round_id"),
+                "trade_pk": trade_pk,
             }
             self.risk.state.set_positions_meta(meta)
         return execution
