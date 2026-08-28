@@ -1,0 +1,45 @@
+{
+  "round_id": "20260828_223325_001",
+  "ts": 1787927605.614936,
+  "mode": "paper",
+  "account": {
+    "equity": 10000.0,
+    "hwm": 10000.0,
+    "drawdown": 0.0,
+    "usdt_avail": 10000.0
+  },
+  "positions": [],
+  "factors": {
+    "BTC-USDT-SWAP": null,
+    "ETH-USDT-SWAP": null,
+    "SOL-USDT-SWAP": null
+  },
+  "committee": {
+    "action": "hold",
+    "mode": "baseline",
+    "analysts": [
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "趋势猎手",
+        "style": "trend"
+      },
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "均值回归者",
+        "style": "meanrev"
+      },
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "资金哨兵",
+        "style": "funding"
+      }
+    ],
+    "reason": "所有分析师弃权，本轮不交易"
+  },
+  "status": "no_action",
+  "decision_reason": "所有分析师弃权，本轮不交易",
+  "duration_sec": 81.21
+}

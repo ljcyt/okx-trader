@@ -1,0 +1,157 @@
+{
+  "round_id": "20260828_223936_001",
+  "ts": 1787927976.659224,
+  "mode": "paper",
+  "account": {
+    "equity": 10000.0,
+    "hwm": 10000.0,
+    "drawdown": 0.0,
+    "usdt_avail": 10000.0
+  },
+  "positions": [],
+  "factors": {
+    "BTC-USDT-SWAP": {
+      "price": 79500.0,
+      "trend": "交织/震荡",
+      "rsi14": 28.366583541147136,
+      "atr": 690.057142857143,
+      "atr_pct": 0.008679964061096139,
+      "funding_rate": 0.0001,
+      "pattern": "十字星",
+      "vol_ratio": 4.25968883293691,
+      "price_vs_boll": "轨道内"
+    },
+    "ETH-USDT-SWAP": {
+      "price": 2513.23,
+      "trend": "多头排列（价>EMA20>EMA60）",
+      "rsi14": 49.70667196977223,
+      "atr": 26.029285714285702,
+      "atr_pct": 0.010356905541588196,
+      "funding_rate": 0.0001,
+      "pattern": "十字星",
+      "vol_ratio": 3.3712372559169483,
+      "price_vs_boll": "轨道内"
+    },
+    "SOL-USDT-SWAP": {
+      "price": 106.14,
+      "trend": "交织/震荡",
+      "rsi14": 32.22222222222224,
+      "atr": 1.6271428571428592,
+      "atr_pct": 0.01533015693558375,
+      "funding_rate": 0.0001,
+      "pattern": "常规",
+      "vol_ratio": 2.0866195625560287,
+      "price_vs_boll": "轨道内"
+    }
+  },
+  "committee": {
+    "mode": "baseline",
+    "analysts": [
+      {
+        "action": "open",
+        "instId": "ETH-USDT-SWAP",
+        "direction": "long",
+        "stop_loss": 2474.1861,
+        "confidence": 0.65,
+        "order_type": "limit_maker",
+        "reason": "多头排列+MACD死叉绿柱，趋势做多",
+        "analyst": "趋势猎手",
+        "style": "trend",
+        "avg_score": 7.67,
+        "votes": "3/3",
+        "qualify": true
+      },
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "均值回归者",
+        "style": "meanrev"
+      },
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "资金哨兵",
+        "style": "funding"
+      }
+    ],
+    "judging": [
+      {
+        "idx": 0,
+        "judge": "技术裁判",
+        "score": 8.0,
+        "approved": true,
+        "concerns": "无异议"
+      },
+      {
+        "idx": 0,
+        "judge": "风控裁判",
+        "score": 8.0,
+        "approved": true,
+        "concerns": "无异议"
+      },
+      {
+        "idx": 0,
+        "judge": "资金管理裁判",
+        "score": 7.0,
+        "approved": true,
+        "concerns": "异常放量"
+      }
+    ],
+    "scoreboard": [
+      {
+        "analyst": "趋势猎手",
+        "instId": "ETH-USDT-SWAP",
+        "direction": "long",
+        "avg_score": 7.67,
+        "votes": "3/3",
+        "qualify": true
+      }
+    ],
+    "action": "open",
+    "plan": {
+      "instId": "ETH-USDT-SWAP",
+      "direction": "long",
+      "stop_loss": 2474.1861,
+      "entry_hint": null,
+      "order_type": "limit_maker",
+      "confidence": 0.65,
+      "reason": "[趋势猎手] 多头排列+MACD死叉绿柱，趋势做多 ｜委员会均分 7.67（3/3 通过）",
+      "committee_score": 7.67
+    },
+    "reason": "胜出提案：趋势猎手 → ETH-USDT-SWAP long 均分 7.67（3/3 通过）"
+  },
+  "risk": {
+    "passed": true,
+    "failures": [],
+    "warnings": [
+      "仓位 25.61 张（名义 6436 U，单笔风险 1.00%，加仓后总杠杆 0.64x，ATR=26.0）"
+    ],
+    "sized": {
+      "instId": "ETH-USDT-SWAP",
+      "direction": "long",
+      "contracts": 25.61,
+      "entry_ref": 2513.17,
+      "stop_loss": 2474.1861,
+      "notional_usdt": 6436.22837,
+      "risk_usdt": 99.83776790000044,
+      "risk_pct": 0.009983776790000044,
+      "atr": 26.029285714285702,
+      "leverage_after": 0.643622837
+    }
+  },
+  "execution": {
+    "status": "simulated",
+    "would": {
+      "instId": "ETH-USDT-SWAP",
+      "direction": "long",
+      "contracts": 25.61,
+      "maker_px": 2511.99,
+      "stop_loss": 2474.1861,
+      "risk_usdt": 99.83776790000044,
+      "risk_pct": 0.009983776790000044,
+      "notional_usdt": 6436.22837
+    }
+  },
+  "status": "dry_run_planned",
+  "duration_sec": 2.18
+}

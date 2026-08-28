@@ -19,17 +19,16 @@ except Exception:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import loop as loop_mod
-from client import OKXAPIError
-from state import StateStore
+from okx_trader import loop as loop_mod
+from okx_trader.client import OKXAPIError
+from okx_trader.env import ENVS
+from okx_trader.store.db import Store
 
 
-def make_loop(tmp_dir):
-    """纸面模式的 TradingLoop，状态与 rounds 落盘都指向临时目录。"""
-    lp = loop_mod.TradingLoop()
-    lp.state = StateStore(path=os.path.join(tmp_dir, "state.json"))
-    lp.risk.state = lp.state
-    loop_mod.ROUNDS_DIR = os.path.join(tmp_dir, "rounds")
+def make_loop(tmp_dir, env="paper"):
+    """纸面模式 TradingLoop，SQLite 指向临时目录（不污染真实数据）。"""
+    lp = loop_mod.TradingLoop(env_name=env,
+                              store=Store(os.path.join(tmp_dir, "trader.db")))
     return lp
 
 
@@ -66,7 +65,14 @@ class DataUnavailableTest(unittest.TestCase):
         self.assertEqual(record["status"], "data_unavailable")
         self.assertFalse(record["data_ok"])
         self.assertEqual(record["symbols_ok"], 0)
-        self.assertEqual(len(record["factor_errors"]), lp.cfg.SYMBOLS.__len__())
+        self.assertEqual(len(record["factor_errors"]), len(lp.cfg.SYMBOLS))
+
+
+class _fake_rw:
+    """巡检写库用的 RoundWriter 替身：只记录事件，不真写库。"""
+    pk = None  # NULL round_pk 合法（不挂轮次的事件）
+    def write_order(self, *a, **k):
+        pass
 
 
 class FakeLiveClient:
@@ -107,40 +113,40 @@ class OcoPatrolTest(unittest.TestCase):
     def test_patrol_reattaches_once_and_keeps_target(self):
         tmp = tempfile.mkdtemp(prefix="okxt-test-")
         lp = make_loop(tmp)
-        # 强制进入"真实账户"分支（巡检只在 live 非 dry 模式动账）
-        lp.creds_ok = True
-        lp.dry_run = False
+        # 强制进入会执行的环境（巡检只在 executing 时动账）
+        lp.env = ENVS["demo"]
+        lp.executing = True
         fake = FakeLiveClient()
         lp.client = fake
-        lp.state.set_positions_meta({"ETH-USDT-SWAP": {
+        lp.risk.state.set_positions_meta({"ETH-USDT-SWAP": {
             "direction": "long", "stop": 2474.19, "target": 2590.62,
             "contracts": 25.61, "opened_at": "2026-08-28 23:00:00",
         }})
 
         # 第 1 轮：交易所查不到保护单（旧 bug 场景）→ 补挂一张，且带 meta 里的 target
         fake.queue_sl([])  # 本轮合并查询（conditional+oco）结果为空
-        lp._patrol_positions(self.SNAP)
+        lp._patrol_positions(self.SNAP, _fake_rw())
         self.assertEqual(len(fake.place_calls), 1)
         self.assertEqual(fake.place_calls[0]["tp"], 2590.62)   # OCO 未被降级
         self.assertEqual(fake.place_calls[0]["stop"], 2474.19)
-        meta = lp.state.get_positions_meta()["ETH-USDT-SWAP"]
+        meta = lp.risk.state.get_positions_meta()["ETH-USDT-SWAP"]
         self.assertEqual(meta["algo_id"], "algo1")
 
         # 第 2 轮：合并查询能看到那张 OCO → 不再重复挂（回归：漏查 oco 会叠加止损单）
         fake.queue_sl([{"algoId": "algo1", "ord_type": "oco", "state": "live",
                         "side": "sell", "sz": "25.61", "sl_trigger_px": 2474.19,
                         "tp_trigger_px": 2590.62}])
-        lp._patrol_positions(self.SNAP)
+        lp._patrol_positions(self.SNAP, _fake_rw())
         self.assertEqual(len(fake.place_calls), 1)  # 仍是 1 次
 
     def test_no_position_no_action(self):
         tmp = tempfile.mkdtemp(prefix="okxt-test-")
         lp = make_loop(tmp)
-        lp.creds_ok = True
-        lp.dry_run = False
+        lp.env = ENVS["demo"]
+        lp.executing = True
         fake = FakeLiveClient()
         lp.client = fake
-        lp._patrol_positions({"positions": [], "factors": {}})
+        lp._patrol_positions({"positions": [], "factors": {}}, _fake_rw())
         self.assertEqual(fake.place_calls, [])
 
 

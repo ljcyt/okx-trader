@@ -13,7 +13,7 @@ try:  # GBK 控制台兜底；包在 try 里以便 pytest 收集时不炸
 except Exception:
     pass
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))  # okx_trader/ 目录，使顶层模块可导入
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))  # 仓库根，使 okx_trader 可导入
 
 
 # ── Stub：替代 OKXDemoClient 的最小接口 ─────────────────────────────
@@ -50,8 +50,8 @@ class StubClient:
         return self._atr
 
     def round_size(self, sz, lot_sz, min_sz):
-        from client import OKXDemoClient
-        return OKXDemoClient.round_size(sz, lot_sz, min_sz)
+        from okx_trader.client import OKXClient
+        return OKXClient.round_size(sz, lot_sz, min_sz)
 
 
 class StubState:
@@ -93,7 +93,7 @@ def make_plan(**kw):
 
 class RiskRulesTest(unittest.TestCase):
     def setUp(self):
-        from risk import RiskManager
+        from okx_trader.risk import RiskManager
         self.RiskManager = RiskManager
         self.rm = RiskManager(make_cfg(), StubClient(), StubState())
 
@@ -193,7 +193,7 @@ class R7TargetSelectionTest(unittest.TestCase):
     """R7 目标选择：MIN_TARGET_ATR 过滤贴脸位 → 第一个够本的位 → ATR 兜底。"""
 
     def setUp(self):
-        from risk import RiskManager
+        from okx_trader.risk import RiskManager
         self.rm = RiskManager(make_cfg(), StubClient(), StubState())
 
     def test_real_record_case_passes_with_far_structure(self):

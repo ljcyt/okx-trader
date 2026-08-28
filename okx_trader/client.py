@@ -1,36 +1,25 @@
 # -*- coding: utf-8 -*-
-"""OKX 模拟盘客户端封装（第二步交付物）
+"""OKX REST 客户端封装（demo/live 由 env.TradingEnv 决定 flag）。
 
 对 python-okx 官方库做一层薄封装，提供交易循环需要的最小接口集：
-    账户：get_equity / get_positions / get_account_mode
+    账户：get_equity / get_positions / get_account_mode / set_leverage
     行情：get_ticker / get_funding_rate / get_candles / get_instrument
     交易：place_maker_limit / cancel_order / get_order / get_pending_orders
-    止损：place_stop_loss / get_pending_stop_losses / cancel_stop_loss
+    保护：place_stop_loss / get_pending_stop_losses / get_algo_order_details
 
 设计要点：
-    1. 模拟盘：所有请求自动带 x-simulated-trading: 1（python-okx 在 flag="1" 时自动加），
-       REST 域名与实盘相同（www.okx.com）。
-    2. 统一错误处理：所有响应 code != "0" 抛 OKXAPIError（带 code/msg）；
-       网络错误和限频自动重试。
-    3. 统一日志：每次调用记录到控制台 + logs/okx_client.log。
-    4. SWAP 合约的 sz 单位是「张」（1 张 = ctVal 个币），本层提供
-       base→张 的换算和价格/数量按交易所精度取整的工具。
+    1. 环境标志（x-simulated-trading）由 env.TradingEnv.okx_flag 派生，本层不自判。
+    2. 统一错误处理：响应 code != "0" 抛 OKXAPIError；网络错误和限频自动重试。
+    3. 统一日志：控制台 + logs/okx_client.log（见 config.get_logger）。
+    4. SWAP 的 sz 单位是「张」（1 张 = ctVal 个币），本层提供取整工具。
 """
-import importlib.util
 import json
-import logging
-import os
-import sys
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from logging.handlers import RotatingFileHandler
 
 import httpx
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-# 模拟盘固定 flag（"1"=Demo）。想连实盘就改 okx_config.py 里的 OKX_FLAG。
-DEMO_FLAG = "1"
+from .config import get_logger, load_config
 
 # 重试策略：网络错误/限频最多重试次数
 MAX_RETRIES = 3
@@ -50,57 +39,6 @@ class OKXAPIError(Exception):
         super().__init__(f"OKX API 错误 code={code} msg={msg} data={data}")
 
 
-def get_logger(name="okx_trader", level="INFO"):
-    """统一日志：控制台 + logs/okx_client.log（滚动，5MB×3 份）。"""
-    logger = logging.getLogger(name)
-    if logger.handlers:  # 已初始化过，避免重复 handler
-        return logger
-
-    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
-    fmt = logging.Formatter(
-        "%(asctime)s %(levelname)-7s %(name)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-    )
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    logger.addHandler(console)
-
-    log_dir = os.path.join(HERE, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    file_handler = RotatingFileHandler(
-        os.path.join(log_dir, "okx_client.log"),
-        maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-    logger.addHandler(file_handler)
-
-    return logger
-
-
-def load_config():
-    """加载 okx_config.py（用户本地填写，不入库）。未填凭证直接抛错。"""
-    path = os.path.join(HERE, "okx_config.py")
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"找不到配置文件 {path}\n"
-            f"请把模板复制过去：cp okx_trader/okx_config_template.py okx_trader/okx_config.py"
-        )
-    spec = importlib.util.spec_from_file_location("okx_config", path)
-    cfg = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(cfg)
-
-    for field in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"):
-        if "在此填入" in str(getattr(cfg, field, "")):
-            raise RuntimeError(
-                f"okx_config.py 中的 {field} 还没填。"
-                f"请填入【模拟盘专属】API Key（OKX 网页 → 交易 → 模拟交易 → API 创建）"
-            )
-    if str(getattr(cfg, "OKX_FLAG", "1")) != DEMO_FLAG:
-        # 目前整套系统按模拟盘设计，防呆：改 flag 需要同时改这里
-        raise RuntimeError("当前版本仅支持模拟盘（OKX_FLAG 必须为 \"1\"）")
-    return cfg
-
-
 # 周期 → 秒数（用于识别未收盘的当前 K 线）
 BAR_SECONDS = {
     "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
@@ -108,23 +46,26 @@ BAR_SECONDS = {
 }
 
 
-class OKXDemoClient:
-    """OKX 模拟盘客户端。tdMode 固定用 cross（全仓），简单可靠。"""
+class OKXClient:
+    """OKX REST 客户端。tdMode 固定用 cross（全仓），简单可靠。"""
 
     def __init__(self, cfg=None, logger=None, api_key=None, api_secret_key=None,
-                 passphrase=None, proxy=None):
+                 passphrase=None, proxy=None, flag="1"):
         from okx import Account, MarketData, PublicData, Trade  # 延迟导入，方便单元测试
 
         self.cfg = cfg or load_config()
         self.log = logger or get_logger(level=getattr(self.cfg, "LOG_LEVEL", "INFO"))
-        # 显式传入的凭证优先于配置文件（PaperClient 传 "-1" 表示不签名，且不改写 cfg）
-        api_key = api_key if api_key is not None else self.cfg.OKX_API_KEY
+        # 显式传入的凭证优先于配置（SecretStr 明文只在这里解一次）
+        api_key = api_key if api_key is not None else self.cfg.credential("OKX_API_KEY")
         api_secret_key = (api_secret_key if api_secret_key is not None
-                          else self.cfg.OKX_SECRET_KEY)
-        passphrase = passphrase if passphrase is not None else self.cfg.OKX_PASSPHRASE
+                          else self.cfg.credential("OKX_SECRET_KEY"))
+        passphrase = (passphrase if passphrase is not None
+                      else self.cfg.credential("OKX_PASSPHRASE"))
         proxy = proxy if proxy is not None else (getattr(self.cfg, "OKX_PROXY", "") or None)
 
-        common = dict(flag=str(self.cfg.OKX_FLAG), proxy=proxy, debug=False)
+        # flag 只能由 env.TradingEnv 派生传入（"1"=demo / "0"=live），
+        # 配置里的任何字段都翻不动它
+        common = dict(flag=str(flag), proxy=proxy, debug=False)
         self.account = Account.AccountAPI(
             api_key=api_key, api_secret_key=api_secret_key, passphrase=passphrase,
             **common,

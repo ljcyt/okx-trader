@@ -11,15 +11,9 @@
 LLM 模式：每个 agent 独立调用模型（同一模型不同人设 prompt）。
 基线模式（无 LLM）：每个 agent 用确定性规则模拟，保证链路可先跑通。
 """
-import json
-import os
 import time
-from collections import deque
 
-from llm import LLMClient
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROUNDS_JSONL = os.path.join(HERE, "data", "rounds", "rounds.jsonl")
+from .llm import LLMClient
 
 # 裁判法定人数：有效票不足此数时提案不能胜出（防止 LLM 超时导致单裁判独裁）
 MIN_JUDGE_VOTES = 2
@@ -67,11 +61,13 @@ SCORE_THRESHOLD_DEFAULT = 6.5
 
 
 class Committee:
-    def __init__(self, cfg, client, llm=None):
+    def __init__(self, cfg, client, llm=None, store=None, env="paper"):
         self.cfg = cfg
         self.client = client
         self.llm = llm or LLMClient(cfg, logger=client.log)
         self.log = client.log
+        self.store = store      # 可选：传入后记忆从 SQLite 读
+        self.env = env
         self.threshold = getattr(cfg, "SCORE_THRESHOLD", SCORE_THRESHOLD_DEFAULT)
 
     # ────────────────────────── 主入口 ──────────────────────────
@@ -95,8 +91,9 @@ class Committee:
         # 1. 分析师提案
         proposals = []
         analyst_log = []
-        for a in ANALYSTS:
+        for slot, a in enumerate(ANALYSTS):
             prop = self._ask_analyst(a, factor_text, account_ctx, held, snapshot)
+            prop["slot"] = slot
             analyst_log.append(prop)
             if prop.get("action") == "open":
                 proposals.append(prop)
@@ -154,6 +151,7 @@ class Committee:
                 "reason": (f"[{win['analyst']}] {win['reason']} "
                            f"｜委员会均分 {win['avg_score']}（{win['votes']} 通过）"),
                 "committee_score": win["avg_score"],
+                "analyst": win["analyst"],
                 "factors": {k: src_report[k] for k in ("sr", "atr") if k in src_report},
             }
             decision["reason"] = (
@@ -176,27 +174,25 @@ class Committee:
     def recent_rounds_summary(self, n=8):
         """轻量记忆/反思：读最近 n 轮的落盘记录，压成几行文字回喂给 LLM agent，
         让委员会知道自己最近提了什么、结果如何（借鉴 LLM_trader 的历史记忆机制）。"""
-        if not os.path.exists(ROUNDS_JSONL):
+        if self.store is None:
+            return ""
+        try:
+            rows = self.store.query(
+                "SELECT r.ts, r.status, p.inst_id, p.direction, p.avg_score "
+                "FROM rounds r LEFT JOIN proposals p "
+                "ON p.round_pk = r.id AND p.is_winner = 1 "
+                "ORDER BY r.ts DESC LIMIT ?", (n,))
+        except Exception:  # noqa: BLE001 —— 记忆只是增益，查不到就空着
             return ""
         lines = []
-        try:
-            with open(ROUNDS_JSONL, "r", encoding="utf-8") as f:
-                recent = deque(f, maxlen=n)  # 只驻留最后 n 行，不整文件载入
-            for raw in recent:
-                try:
-                    r = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                ts = time.strftime("%m-%d %H:%M", time.localtime(float(r.get("ts") or 0)))
-                plan = (r.get("committee") or {}).get("plan") or r.get("planner") or {}
-                what = ""
-                if plan:
-                    what = (f"{plan.get('instId')} {plan.get('direction')}"
-                            f"（均分{plan.get('committee_score', '—')}）")
-                lines.append(f"  {ts} 状态={r.get('status')} {what}")
-        except OSError:
-            return ""
-        return "\n".join(lines) if lines else ""
+        for r in rows:
+            ts = time.strftime("%m-%d %H:%M", time.localtime(r["ts"] or 0))
+            what = (f"{r['inst_id']} {r['direction']}（均分{r['avg_score']}）"
+                    if r["inst_id"] else "")
+            lines.append(f"  {ts} 状态={r['status']} {what}")
+        return "\n".join(reversed(lines))
+
+
 
     # ────────────────────────── 分析师 ──────────────────────────
 
@@ -211,7 +207,8 @@ class Committee:
                     f'"stop_loss":数字,"confidence":0~1,"reason":"..."}}\n'
                     f'弃权: {{"action":"hold","reason":"..."}}')
             try:
-                out = self.llm.chat(analyst["prompt"], user, expect_json=True)
+                out = self.llm.chat(analyst["prompt"], user, expect_json=True,
+                                    role=f"analyst:{analyst['name']}")
                 out.update(base)
                 if out.get("action") == "open":
                     out.setdefault("order_type", "limit_maker")
@@ -251,7 +248,8 @@ class Committee:
                         f'{{"scores":[{{"idx":0,"score":0~10,"approved":true/false,'
                         f'"concerns":"一句话"}}]}}')
                 try:
-                    out = self.llm.chat(j["prompt"], user, expect_json=True)
+                    out = self.llm.chat(j["prompt"], user, expect_json=True,
+                                    role=f"judge:{j['name']}")
                     for row in out.get("scores", []):
                         idx = int(row.get("idx", -1))
                         if 0 <= idx < len(proposals):
@@ -368,5 +366,5 @@ def _baseline_judge(judge_name, p, snapshot, cfg):
 
 
 def format_one(report):
-    from factors import format_factor_report
+    from .factors import format_factor_report
     return format_factor_report(report)

@@ -1,0 +1,182 @@
+{
+  "round_id": "20260829_002832_001",
+  "ts": 1787934512.9965575,
+  "mode": "paper",
+  "account": {
+    "equity": 10000.0,
+    "hwm": 10000.0,
+    "drawdown": 0.0,
+    "usdt_avail": 10000.0
+  },
+  "positions": [],
+  "factors": {
+    "BTC-USDT-SWAP": {
+      "price": 78299.6,
+      "trend": "交织/震荡",
+      "rsi14": 19.25112042793127,
+      "atr": 747.9285714285714,
+      "atr_pct": 0.009552137832486646,
+      "funding_rate": 0.0001,
+      "pattern": "常规",
+      "vol_ratio": 2.3231658514630094,
+      "price_vs_boll": "下轨下方"
+    },
+    "ETH-USDT-SWAP": {
+      "price": 2470.79,
+      "trend": "交织/震荡",
+      "rsi14": 35.51160791057606,
+      "atr": 27.06571428571429,
+      "atr_pct": 0.010954275468863923,
+      "funding_rate": 9.43555958276e-05,
+      "pattern": "大阴线",
+      "vol_ratio": 2.0010391533660132,
+      "price_vs_boll": "下轨下方"
+    },
+    "SOL-USDT-SWAP": {
+      "price": 105.2,
+      "trend": "交织/震荡",
+      "rsi14": 33.62831858407077,
+      "atr": 1.6785714285714306,
+      "atr_pct": 0.015956002172732228,
+      "funding_rate": 0.0001,
+      "pattern": "常规",
+      "vol_ratio": 13.634334189897052,
+      "price_vs_boll": "轨道内"
+    }
+  },
+  "data_ok": true,
+  "symbols_ok": 3,
+  "symbols_total": 3,
+  "committee": {
+    "mode": "baseline",
+    "analysts": [
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "趋势猎手",
+        "style": "trend"
+      },
+      {
+        "action": "open",
+        "instId": "BTC-USDT-SWAP",
+        "direction": "long",
+        "stop_loss": 77551.6714,
+        "confidence": 0.5,
+        "order_type": "limit_maker",
+        "reason": "RSI 19 超卖且触布林下轨，回归做多",
+        "analyst": "均值回归者",
+        "style": "meanrev",
+        "avg_score": 7.5,
+        "votes": "3/3",
+        "qualify": true
+      },
+      {
+        "action": "hold",
+        "reason": "无符合人设信号",
+        "analyst": "资金哨兵",
+        "style": "funding"
+      }
+    ],
+    "judging": [
+      {
+        "idx": 0,
+        "judge": "技术裁判",
+        "score": 8.0,
+        "approved": true,
+        "concerns": "无异议"
+      },
+      {
+        "idx": 0,
+        "judge": "风控裁判",
+        "score": 8.0,
+        "approved": true,
+        "concerns": "无异议"
+      },
+      {
+        "idx": 0,
+        "judge": "资金管理裁判",
+        "score": 6.5,
+        "approved": true,
+        "concerns": "无异议"
+      }
+    ],
+    "scoreboard": [
+      {
+        "analyst": "均值回归者",
+        "instId": "BTC-USDT-SWAP",
+        "direction": "long",
+        "avg_score": 7.5,
+        "votes": "3/3",
+        "qualify": true
+      }
+    ],
+    "action": "open",
+    "plan": {
+      "instId": "BTC-USDT-SWAP",
+      "direction": "long",
+      "stop_loss": 77551.6714,
+      "entry_hint": null,
+      "order_type": "limit_maker",
+      "confidence": 0.5,
+      "reason": "[均值回归者] RSI 19 超卖且触布林下轨，回归做多 ｜委员会均分 7.5（3/3 通过）",
+      "committee_score": 7.5,
+      "factors": {
+        "sr": {
+          "supports": [
+            78010.333333,
+            77777.0,
+            77520.0,
+            77260.6
+          ],
+          "resistances": [
+            78800.0,
+            79000.0,
+            79336.066667,
+            79896.166667
+          ]
+        },
+        "atr": 747.9285714285714
+      }
+    },
+    "reason": "胜出提案：均值回归者 → BTC-USDT-SWAP long 均分 7.5（3/3 通过）"
+  },
+  "risk": {
+    "passed": true,
+    "failures": [],
+    "warnings": [
+      "R2: 止损距离 0.096% 过近（< 0.2%），按 ATR 下限处理",
+      "仓位 8.91 张（名义 6916 U，单笔风险 0.07%，加仓后总杠杆 0.69x，ATR=747.9）",
+      "盈亏比 RR=15.79（目标 7.88e+04，来源 structure）"
+    ],
+    "sized": {
+      "instId": "BTC-USDT-SWAP",
+      "direction": "long",
+      "contracts": 8.91,
+      "entry_ref": 77626.0,
+      "stop_loss": 77551.6714,
+      "notional_usdt": 6916.4766,
+      "risk_usdt": 6.622678259999417,
+      "risk_pct": 0.0006622678259999418,
+      "atr": 747.9285714285714,
+      "leverage_after": 0.69164766,
+      "target": 78800.0,
+      "target_source": "structure",
+      "rr": 15.79
+    }
+  },
+  "execution": {
+    "status": "simulated",
+    "would": {
+      "instId": "BTC-USDT-SWAP",
+      "direction": "long",
+      "contracts": 8.91,
+      "maker_px": 77553.2,
+      "stop_loss": 77551.6714,
+      "risk_usdt": 6.622678259999417,
+      "risk_pct": 0.0006622678259999418,
+      "notional_usdt": 6916.4766
+    }
+  },
+  "status": "dry_run_planned",
+  "duration_sec": 5.66
+}

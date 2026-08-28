@@ -15,9 +15,13 @@ OKX_API_KEY     = "在此填入模拟盘APIKey"
 OKX_SECRET_KEY  = "在此填入模拟盘SecretKey"
 OKX_PASSPHRASE  = "在此填入模拟盘Passphrase"
 
-# 模拟盘标志："1" = 模拟盘（Demo Trading）；"0" = 实盘（真实资金，慎改！）。
-# 客户端会把它放进请求头 x-simulated-trading。
-OKX_FLAG = "1"
+# 交易环境（唯一开关，见 okx_trader/env.py）：
+#   paper  = 纸面（真实行情+虚拟账户，不需要 Key）
+#   demo   = OKX 模拟盘真实下单（需要模拟盘 Key）
+#   replay = 全离线回放（测试用）
+# 实盘（live）需要 TRADING_ENV="live" 且手打 ALLOW_LIVE_TRADING=True 两处独立改动。
+# OKX_FLAG 不再从配置读取——由环境派生，配置里写了也无效。
+TRADING_ENV = "paper"
 
 # 可选：HTTP(S) 代理，例如 "http://127.0.0.1:7890"；留空表示直连。
 # 直连不通时（国内网络常见），先在 Clash/V2Ray 等工具里确认代理端口并填到这里。
@@ -52,10 +56,6 @@ TARGET_ATR_MULT = 2.5         # 无可用结构位时的 ATR 兜底目标倍数
 # 杠杆
 LEVERAGE = 3                  # 单合约杠杆（开仓前自动设置；总杠杆另受 MAX_TOTAL_LEVERAGE 约束）
 
-# ── 运行模式 ─────────────────────────────────────────────────────────────────
-# DRY_RUN = True：只分析、只记录，不下真单（无 Key 时自动进入纸面模式）
-# DRY_RUN = False：真实在 OKX 模拟盘下单（需要填好上面的凭证并通过 check_env）
-DRY_RUN = True
 PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 
 # ── 决策模式（第四步/多agent委员会）──────────────────────────────────────────
@@ -68,9 +68,19 @@ LOOP_INTERVAL_SEC = 3600      # 交易循环每轮间隔（秒）—— 建议�
 LLM_API_BASE = ""             # 例如 "https://api.openai.com/v1" 或任意兼容中转
 LLM_API_KEY = ""              # 对应 API Key
 LLM_MODEL = ""                # 例如 "gpt-4o"、"glm-4.7" 等
+LLM_ENDPOINTS = []            # 多端点 failover（按序切换），单端点用 LLM_API_BASE 即可
+LLM_TIMEOUT_SEC = 60
 
 # 日志与数据
 LOG_LEVEL = "INFO"            # DEBUG / INFO / WARNING / ERROR
 LOG_DIR = "logs"              # 运行日志目录（相对 okx_trader/，已 gitignore）
 ROUNDS_DIR = "data/rounds"    # 每轮决策记录目录（对应 rounds 页面，已 gitignore）
 STATE_DIR = "data/state"      # 权益高水位等运行状态（已 gitignore）
+
+# ── Web 面板（Phase 4 起）────────────────────────────────────────────────────
+WEB_HOST = "127.0.0.1"        # 局域网暴露是显式 opt-in（"0.0.0.0"），且必须设密码
+WEB_PORT = 8787
+WEB_PASSWORD = ""             # 非回环绑定 + 空密码 = 拒绝启动
+
+# ── 告警（Phase 7）───────────────────────────────────────────────────────────
+ALERT_WEBHOOK_URL = ""        # 飞书群机器人 webhook；留空则不发告警

@@ -17,10 +17,10 @@ try:
 except Exception:
     pass
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
-from factors import macd, _ema_series, fvg_list, build_factor_report, _bar_seconds
-from client import OKXDemoClient
+from okx_trader.factors import macd, fvg_list, build_factor_report, _bar_seconds
+from okx_trader.client import OKXClient
 
 
 def make_candles(n=80, start=100.0, step=1.0, end_ts_ms=None):
@@ -94,7 +94,7 @@ class CandleCleaningTest(unittest.TestCase):
         rows = [[1000 + i * 3600000, "1", "2", "0.5", "1.5", "10", "0", "0", "1"]
                 for i in range(5)]
         rows.append([6000, "1", "2", "0.5", "1.5", "10", "0", "0", "0"])  # 未收盘
-        cleaned, dropped = OKXDemoClient._clean_candle_rows(rows, "1H")
+        cleaned, dropped = OKXClient._clean_candle_rows(rows, "1H")
         self.assertEqual(len(cleaned), 5)
         self.assertEqual(dropped, 1)
         self.assertEqual(int(cleaned[-1][0]), 1000 + 4 * 3600000)
@@ -106,14 +106,14 @@ class CandleCleaningTest(unittest.TestCase):
                 [now - 2 * 3600000, "1", "2", "0.5", "1.5", "10"],
                 [now - 3600000, "1", "2", "0.5", "1.5", "10"],
                 [now - 600000, "1", "2", "0.5", "1.5", "10"]]  # 才过 10 分钟
-        cleaned, dropped = OKXDemoClient._clean_candle_rows(rows, "1H", now_ms=now)
+        cleaned, dropped = OKXClient._clean_candle_rows(rows, "1H", now_ms=now)
         self.assertEqual(len(cleaned), 3)
         self.assertEqual(dropped, 1)
 
     def test_confirm_all_closed_drops_nothing(self):
         rows = [[1000 + i * 3600000, "1", "2", "0.5", "1.5", "10", "0", "0", "1"]
                 for i in range(5)]
-        cleaned, dropped = OKXDemoClient._clean_candle_rows(rows, "1H")
+        cleaned, dropped = OKXClient._clean_candle_rows(rows, "1H")
         self.assertEqual((len(cleaned), dropped), (5, 0))
 
 

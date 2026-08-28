@@ -25,7 +25,7 @@
 """
 import time
 
-from client import OKXAPIError
+from .client import OKXAPIError
 
 
 class RiskVerdict:
