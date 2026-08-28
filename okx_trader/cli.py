@@ -51,8 +51,26 @@ def cmd_run_once(args):
     return 0
 
 
+def _acquire_loop_lock(port=8777):
+    """绑 127.0.0.1:8777 做单例锁：第二个循环进程直接退出。
+
+    两个循环同时操作一个账户是真实的资金 bug（重复开仓/重复挂止损）。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.listen(0)
+        return s  # 进程退出时自动释放
+    except OSError:
+        print(f"已有一个交易循环在运行（单例锁 127.0.0.1:{port}），拒绝启动第二个。",
+              file=sys.stderr)
+        sys.exit(2)
+
+
 def cmd_run_loop(args):
     import threading
+
+    _acquire_loop_lock()
 
     from .config import get_logger
     from .loop import TradingLoop

@@ -1,46 +1,19 @@
-# AI install hint: choose deps by OS/env + needed ui/bot. do NOT install all.
-# minimal core first; missing packages can be installed on demand.
-
 [project]
-name = "genericagent"
-version = "0.1.0"
-description = "Minimalist self-evolving autonomous agent framework"
+name = "okx-trader"
+version = "0.2.0"
+description = "Multi-agent committee trading agent for OKX demo trading, with a web dashboard"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 dependencies = [
     "requests>=2.28",
-    "beautifulsoup4>=4.12",
-    "bottle>=0.12",
-    "simple-websocket-server>=0.4",
-    "aiohttp>=3.9",
+    "bottle>=0.13",
+    "python-okx>=0.4.3,<0.5",
 ]
 
 [project.optional-dependencies]
-# select extras, not all. match current task/env.
-# examples: .[ui] for GUI, bot deps only if bot needed.
-ui = [
-    "streamlit>=1.62",
-    "pywebview>=4.0",
-    "textual>=0.70",
-    # tui_v3 (scrollback-first TUI) — prompt_toolkit replaces textual; rich is
-    # now a direct dependency (was transitive via textual in tui_v2).
-    "prompt_toolkit>=3.0,<4",
-    "rich>=13.0",
-    "pillow>=9.0",
-]
-all-frontends = [
-    "python-telegram-bot>=20.0",
-    "qq-botpy>=1.0",
-    "pycryptodome>=3.19",
-    "qrcode>=7.4",
-    "lark-oapi>=1.0",
-    "wecom-aibot-sdk>=1.0",
-    "dingtalk-stream>=0.20",
-]
-# OKX 模拟盘交易循环（okx_trader/）专用，按需安装：pip install .[okx-trader]
-okx-trader = [
-    "python-okx>=0.4.3,<0.5",
+dev = [
+    "pytest>=7",
 ]
 
 [build-system]
@@ -48,8 +21,7 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = []
-packages = ["ga_cli"]
+packages = ["okx_trader", "okx_trader.store", "okx_trader.web", "okx_trader.alerts"]
 
 [project.scripts]
-ga = "ga_cli.cli:main"
+okxt = "okx_trader.cli:main"

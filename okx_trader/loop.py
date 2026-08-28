@@ -23,9 +23,13 @@ from .committee import Committee
 from .exits import manage_open_positions, open_trade_row, reconcile_closed_trade
 from .env import ENVS, db_path, make_client, resolve_env
 from .factors import build_factor_report, format_factor_report
+from .hooks import register as hook_register, trigger as hook_trigger
 from .risk import RiskManager
 from .store import write as w
 from .store.db import Store, init_db
+
+
+_hooks_wired = False
 
 
 class RunState:
@@ -73,6 +77,7 @@ class TradingLoop:
                                    env=self.env.name)
         self.round_seq = 0
         self.paused = False
+        self._wire_alert_hooks()
         self.last_snapshot = None       # Web 面板读的活状态
         self.next_round_ts = None
         self.last_round_id = None
@@ -84,6 +89,21 @@ class TradingLoop:
                       f"v{__version__}", level="info")
         self.log.info("== %s ==（executing=%s）交易循环就绪",
                       self.env.name, self.executing)
+
+    def _wire_alert_hooks(self):
+        """告警钩子只注册一次：飞书 webhook（可选）监听关键交易事件。"""
+        global _hooks_wired
+        if _hooks_wired:
+            return
+        _hooks_wired = True
+        url = getattr(self.cfg, "ALERT_WEBHOOK_URL", "")
+        if url:
+            from .alerts.webhook import make_hook
+            for event, floor in (("data_degraded", "warn"),
+                                 ("circuit_breaker", "warn"),
+                                 ("naked_position", "critical"),
+                                 ("trade_closed", "info")):
+                hook_register(event, make_hook(url, floor))
 
     @staticmethod
     def _db_path():
@@ -196,6 +216,8 @@ class TradingLoop:
                 self.log.error("数据降级：%s —— 本轮记为 data_unavailable", msg)
                 w.write_event(self.store, self.env.name, "data_degraded", msg,
                               level="warn", round_pk=rw.pk)
+                hook_trigger("data_degraded", {"kind": "data_degraded",
+                             "level": "warn", "message": msg})
                 rw.finish("data_unavailable", data_ok=0, symbols_ok=0,
                           symbols_total=snap["symbols_total"],
                           equity=snap["equity"], hwm=snap["hwm"],
@@ -241,6 +263,16 @@ class TradingLoop:
                           open_positions=len(snap["positions"]),
                           duration_sec=round(time.time() - t0, 2))
                 out.update({"status": "risk_rejected", "failures": verdict.failures})
+                if any("熔断" in f for f in verdict.failures):
+                    w.write_event(self.store, self.env.name, "circuit_breaker",
+                                  "回撤熔断生效，禁止开新仓", level="warn", round_pk=rw.pk)
+                    hook_trigger("circuit_breaker", {"kind": "circuit_breaker",
+                                 "level": "warn",
+                                 "message": "；".join(verdict.failures)})
+                else:
+                    hook_trigger("risk_rejected", {"kind": "risk_rejected",
+                                 "level": "info",
+                                 "message": "；".join(verdict.failures)})
                 return out
 
             # 6. 执行
@@ -259,6 +291,11 @@ class TradingLoop:
                       open_positions=len(snap["positions"]),
                       duration_sec=round(time.time() - t0, 2))
             out.update({"status": status, "execution": execution})
+            if status == "opened":
+                hook_trigger("order_filled", {"kind": "order_filled", "level": "info",
+                             "message": f"{verdict.sized['instId']} "
+                                        f"{verdict.sized['direction']} 开仓"
+                                        f"（{verdict.sized['contracts']} 张）"})
         except Exception as e:  # noqa: BLE001 —— 单轮失败不影响下一轮
             self.log.error("本轮异常：%s\n%s", e, traceback.format_exc())
             try:
@@ -270,6 +307,8 @@ class TradingLoop:
             out["error"] = str(e)
         finally:
             self._busy = False
+        hook_trigger("round_done", {"kind": "round_done", "level": "info",
+                                    "message": out.get("status", "?")})
         return out
 
     @staticmethod
