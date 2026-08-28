@@ -64,14 +64,29 @@ PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 
 # ── 决策模式（第四步/多agent委员会）──────────────────────────────────────────
 SCORE_THRESHOLD = 6.5         # Judge 平均分 ≥ 此值 且 多数通过，提案才胜出
+
+# 因子晋级闸门（照抄 trader.gaagent.ai；未晋级因子只观测、永不影响下单）
+FACTOR_GATE = {"scored_days": 15, "days_tracked": 30,
+               "require_positive_rank_ic": True, "min_obs": 100}         # Judge 平均分 ≥ 此值 且 多数通过，提案才胜出
 LOOP_INTERVAL_SEC = 3600      # 交易循环每轮间隔（秒）—— 建议≈K线周期（1H）
 
 # ── Planner / Critic 的 LLM 配置（可选）──────────────────────────────────────
 # 使用 OpenAI 兼容的 chat/completions 接口。三项都填才启用 LLM 决策；
 # 不填则自动降级为内置基线策略（趋势跟随，不调用模型），方便先跑通流程。
-LLM_API_BASE = ""             # 例如 "https://api.openai.com/v1" 或任意兼容中转
+LLM_API_BASE = ""             # 单后端简写；多后端用 LLM_ENDPOINTS
 LLM_API_KEY = ""              # 对应 API Key
 LLM_MODEL = ""                # 例如 "gpt-4o"、"glm-4.7" 等
+# 按角色的后端路由（Phase 9）：每个后端一份凭证；裁判首选与分析师刻意不同
+LLM_ENDPOINTS = {}
+# LLM_ENDPOINTS = {
+#   "gpt": {"api_base": "https://api.openai.com/v1", "api_key": "sk-...", "model": "gpt-4o"},
+#   "glm": {"api_base": "...", "api_key": "...", "model": "glm-4.7"},
+# }
+LLM_ROUTES = {}
+# LLM_ROUTES = {"analyst:趋势猎手": ["gpt", "glm"], "judge": ["glm", "gpt"]}
+# 模型价目表（USD / 1M tokens）：未列出的模型 cost 记 NULL，面板显示"未计价"
+LLM_PRICES = {}
+# LLM_PRICES = {"gpt-4o": {"in": 2.5, "out": 10.0}}
 LLM_ENDPOINTS = []            # 多端点 failover（按序切换），单端点用 LLM_API_BASE 即可
 LLM_TIMEOUT_SEC = 60
 

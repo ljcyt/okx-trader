@@ -1,0 +1,168 @@
+# -*- coding: utf-8 -*-
+"""Phase 10 验证：数字核对（扣分+事件）、修订循环、regime 标签。"""
+import os
+import sys
+import tempfile
+import unittest
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+
+from okx_trader.committee import Committee, verify_numbers
+from okx_trader.factors import overall_regime, regime_label
+from okx_trader.store.db import Store
+
+
+def make_report():
+    """能喂给 format_factor_report 的最小完整报告。"""
+    return {"instId": "BTC-USDT-SWAP", "bar": "1H", "ts": 1000, "time": "01-01 00:00",
+            "price": 78000.0, "ema20": 78100.0, "ema60": 77900.0,
+            "trend": "多头排列（价>EMA20>EMA60）", "structure": "上升结构（HH+HL）",
+            "macd": {"dif": 10.0, "dea": 8.0, "hist": 2.0, "state": "金叉红柱"},
+            "rsi14": 55.0, "atr": 400.0, "atr_pct": 0.005,
+            "boll": {"mid": 78000.0, "upper": 79200.0, "lower": 76800.0,
+                     "width_pct": 0.03},
+            "price_vs_boll": "轨道内", "vol_ratio": 1.2,
+            "funding_rate": 0.0001, "pattern": "常规", "patterns": [],
+            "sr": {"supports": [77000.0], "resistances": [79500.0]},
+            "fvg": [], "mtf": {}, "obi": 0.55, "oi": None,
+            "oi_delta_pct": None, "ls_ratio": 1.1, "taker_ratio": None}
+
+
+def make_committee(store=None):
+    cfg = type("C", (), {"SYMBOLS": ["BTC-USDT-SWAP"], "SCORE_THRESHOLD": 6.5,
+                         "HALLUCINATION_PENALTY": 2.0, "MAX_REVISIONS": 1,
+                         "ATR_BAR": "1H"})()
+    cm = Committee.__new__(Committee)
+    cm.cfg, cm.threshold = cfg, 6.5
+    cm.store = store
+    cm.env = "replay"
+    cm.log = __import__("logging").getLogger("t")
+    cm.llm = type("L", (), {"available": False})()
+    return cm
+
+
+SNAP = {"equity": 10000.0, "positions": [], "drawdown": 0.0,
+        "factors": {"BTC-USDT-SWAP": make_report()}}
+
+
+class VerifyNumbersTest(unittest.TestCase):
+    def test_cited_number_found(self):
+        m = verify_numbers("RSI14 55.0 高于均值且 ATR 400", "RSI14 55.0；ATR 400")
+        self.assertEqual(m, [])
+
+    def test_hallucinated_number_flagged(self):
+        m = verify_numbers("RSI 暴涨到 99.9", "RSI14 55.0；ATR 400",
+                           own=[77000.0])
+        self.assertEqual(m, ["99.9"])
+
+    def test_own_computed_fields_exempt(self):
+        m = verify_numbers("止损 77000.0 置信度 0.6", "RSI14 55.0",
+                           own=[77000.0, 0.6])
+        self.assertEqual(m, [])
+
+    def test_tolerance_half_percent(self):
+        # 报告里是 400，引用 401（+0.25%）应算命中
+        m = verify_numbers("ATR 401", "ATR 400")
+        self.assertEqual(m, [])
+
+
+class HallucinationPenaltyTest(unittest.TestCase):
+    def test_penalty_and_event(self):
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cm = make_committee(store)
+        cm._ask_analyst = lambda *a, **k: {
+            "action": "open", "analyst": "X", "style": "trend",
+            "instId": "BTC-USDT-SWAP", "direction": "long",
+            "stop_loss": 77000.0, "confidence": 0.6,
+            "reason": "RSI 暴涨到 99.9 所以做多"}          # 幻觉数字
+        cm._ask_judges = lambda *a, **k: {"rows": [
+            {"idx": 0, "judge": f"J{i}", "score": 9.0, "approved": True,
+             "concerns": ""} for i in range(3)]}
+        d = cm.decide(SNAP)
+        self.assertTrue(d["action"] == "open")             # 9-2=7 仍 ≥ 6.5
+        self.assertEqual(d["scoreboard"][0]["avg_score"], 7.0)  # 扣了 2.0
+        kinds = [r["kind"] for r in store.query("SELECT kind FROM app_events")]
+        self.assertIn("hallucinated_number", kinds)
+
+
+class RevisionLoopTest(unittest.TestCase):
+    def _make_fake(self, judge_script):
+        """按角色分发的 fake：分析师第 1 次给首提案、第 2 次给修订稿；
+        judge_script 每次「单个裁判调用」给一个分（3 裁判 = 3 次调用/轮）。"""
+        state = {"analyst": 0, "judge": 0}
+
+        def fake_chat(system, user, expect_json=True, role="llm"):
+            if role == "analyst:趋势猎手":
+                state["analyst"] += 1
+                if state["analyst"] == 1:
+                    return {"action": "open", "instId": "BTC-USDT-SWAP",
+                            "direction": "long", "stop_loss": 77000.0,
+                            "confidence": 0.6, "reason": "Delta: 首次提案"}
+                return {"action": "open", "instId": "BTC-USDT-SWAP",
+                        "direction": "long", "stop_loss": 77500.0,
+                        "confidence": 0.7, "reason": "Delta: 收紧止损"}
+            if role.startswith("analyst"):
+                return {"action": "hold", "reason": "Delta: 无信号"}  # 其他人设弃权
+            state["judge"] += 1
+            s, c = judge_script[min(state["judge"] - 1, len(judge_script) - 1)]
+            return {"scores": [{"idx": 0, "score": s, "approved": s >= 6,
+                                "concerns": c or ""}]}
+
+        return fake_chat, state
+
+    def test_veto_then_revise_once(self):
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cm = make_committee(store)
+        cm.llm = type("L", (), {"available": True})()
+        judge_script = [(3.0, "逆势")] * 3 + [(8.0, "")] * 3   # 3 否决 + 3 通过
+        fake_chat, state = self._make_fake(judge_script)
+        cm.llm.chat = fake_chat
+        d = cm.decide(SNAP)
+        self.assertEqual(d.get("revisions"), 1)
+        self.assertEqual(d["action"], "open")
+        self.assertEqual(state["judge"], 6)        # 两轮 × 3 裁判
+        self.assertEqual(state["analyst"], 2)      # 首提 + 修订
+
+    def test_max_revisions_respected(self):
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cm = make_committee(store)
+        cm.llm = type("L", (), {"available": True})()
+        judge_script = [(3.0, "差")] * 6           # 修订后仍全部否决
+        fake_chat, state = self._make_fake(judge_script)
+        cm.llm.chat = fake_chat
+        d = cm.decide(SNAP)
+        self.assertEqual(d.get("revisions"), 1)
+        self.assertEqual(d["action"], "hold")      # 第二次仍不过 → hold
+        self.assertEqual(state["judge"], 6)        # 不会有第三轮打分
+        self.assertEqual(state["analyst"], 2)
+
+
+class RegimeTest(unittest.TestCase):
+    cfg = type("C", (), {"HIGH_VOL_ATR_PCT": 0.03, "TREND_THRESHOLD": 0.45})()
+
+    def test_high_vol(self):
+        r = {"atr_pct": 0.05, "ema20": 100.0, "ema60": 100.2, "atr": 1.0}
+        self.assertEqual(regime_label(r, self.cfg), "high_vol")
+
+    def test_trending(self):
+        r = {"atr_pct": 0.01, "ema20": 102.0, "ema60": 100.0, "atr": 1.0}
+        self.assertEqual(regime_label(r, self.cfg), "trending")   # adx=2.0
+
+    def test_ranging(self):
+        r = {"atr_pct": 0.01, "ema20": 100.1, "ema60": 100.0, "atr": 1.0}
+        self.assertEqual(regime_label(r, self.cfg), "ranging")
+
+    def test_overall_vote(self):
+        f = {"A": {"atr_pct": 0.01, "ema20": 102, "ema60": 100, "atr": 1},
+             "B": {"atr_pct": 0.01, "ema20": 102.2, "ema60": 100, "atr": 1},
+             "C": {"atr_pct": 0.05, "ema20": 1, "ema60": 1, "atr": 1}}
+        self.assertEqual(overall_regime(f, self.cfg), "trending")   # 2:1 投票
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

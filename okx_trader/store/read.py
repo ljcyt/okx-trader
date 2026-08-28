@@ -99,6 +99,26 @@ def stats(store, env=None, frm=None, to=None):
         "SELECT rule_code, COUNT(*) count FROM risk_verdicts "
         "WHERE passed=0 AND rule_code IS NOT NULL GROUP BY rule_code "
         "ORDER BY count DESC")
+    # 模型成本（参考项目口径：从收益里扣，绝不静默略过）
+    import time as _t
+    cost_total = store.query_one("SELECT COALESCE(SUM(cost_usd),0) s "
+                                 "FROM llm_calls")["s"]
+    cost_30d = store.query_one(
+        "SELECT COALESCE(SUM(l.cost_usd),0) s FROM llm_calls l "
+        "JOIN rounds r ON r.id = l.round_pk WHERE r.ts >= ?",
+        (_t.time() - 30 * 86400,))
+    rounds_total = store.query_one("SELECT COUNT(*) c FROM rounds")["c"]
+    by_regime = {}
+    for row in store.query(
+            "SELECT regime, COUNT(*) n, COALESCE(SUM(t.realized_pnl),0) pnl "
+            "FROM rounds r LEFT JOIN trades t ON t.open_round_pk = r.id "
+            "WHERE r.regime IS NOT NULL GROUP BY regime"):
+        by_regime[row["regime"]] = {"n": row["n"], "pnl": row["pnl"]}
+    for name in by_analyst:
+        cnt = store.query_one(
+            "SELECT COUNT(*) c FROM app_events WHERE kind='hallucinated_number' "
+            "AND message LIKE ?", (f"%{name}%",))["c"]
+        by_analyst[name]["hallucination_count"] = cnt
     return {
         "trades": len(trades), "closed": len(closed),
         "win_rate": (len(wins) / len(closed)) if closed else None,
@@ -108,4 +128,9 @@ def stats(store, env=None, frm=None, to=None):
         "worst": min((t["realized_pnl"] or 0) for t in closed) if closed else None,
         "by_symbol": by_symbol, "by_analyst": by_analyst,
         "veto_by_rule": [dict(v) for v in veto],
+        "llm_cost_total": cost_total, "llm_cost_30d": cost_30d,
+        "rounds": rounds_total,
+        "avg_cost_per_round": (cost_total / rounds_total) if rounds_total else None,
+        "net_pnl": sum(t["realized_pnl"] or 0 for t in closed) - cost_total,
+        "by_regime": by_regime,
     }

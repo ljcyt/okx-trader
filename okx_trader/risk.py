@@ -109,8 +109,20 @@ class RiskManager:
         if entry_ref <= 0:
             return v.fail("行情异常：最新价 <= 0，拒绝开仓")
 
-        # ── R5 回撤熔断（先查，熔断时不用算后面）──
-        if self.is_drawdown_breach(equity):
+        # ── R5 回撤阶梯（分级；未配置 DRAWDOWN_LADDER 时退回二元熔断）──
+        rung, tier = self._ladder_tier()
+        if tier is not None:
+            if not tier.get("allow_open", True):
+                hwm = self.state.get_hwm()
+                dd = (hwm - equity) / hwm if hwm > 0 else 0
+                return v.fail(
+                    f"R5: 回撤阶梯第 {rung} 档生效——回撤 {dd:.1%} 禁止开新仓"
+                    f"（风险预算 ×{tier.get('risk_mult', 0)}；恢复需回撤降至 "
+                    f"{tier.get('dd', 0) * 0.8:.1%} 以下）"
+                )
+            if tier.get("risk_mult", 1) < 1:
+                v.warn(f"R5: 回撤阶梯第 {rung} 档——风险预算 ×{tier['risk_mult']}")
+        elif self.is_drawdown_breach(equity):
             hwm = self.state.get_hwm()
             dd = (hwm - equity) / hwm if hwm > 0 else 0
             return v.fail(
@@ -182,7 +194,8 @@ class RiskManager:
             #   计划止损太近 → 用 ATR 距离算仓位（实际止损仍在计划价，只会更保守）
             #   波动放大 → ATR 变大 → 仓位自动变小（波动率目标）
             eff_dist = max(stop_dist, atr_dist)
-            risk_budget = equity * self.cfg.MAX_RISK_PER_TRADE
+            risk_budget = equity * self.cfg.MAX_RISK_PER_TRADE \
+                * (tier.get("risk_mult", 1.0) if tier else 1.0)
 
             # 每张合约在有效止损距离下的亏损（USDT 本位）= eff_dist × ctVal
             contracts_raw = risk_budget / (eff_dist * inst["ctVal"])
@@ -287,6 +300,20 @@ class RiskManager:
         return v
 
     # ────────────────────────── 回撤熔断 ──────────────────────────
+
+    def _ladder_tier(self):
+        """当前回撤档位：rung 从 run_state 读取（由 tick 维护）。
+        未配置阶梯或 state 不支持时返回 (0, None)。"""
+        ladder = list(getattr(self.cfg, "DRAWDOWN_LADDER", []) or [])
+        if not ladder:
+            return 0, None
+        try:
+            rung = int(self.state.get_rung() or 0)
+        except AttributeError:  # 测试 stub 没有 rung 概念
+            return 0, None
+        if 0 < rung <= len(ladder):
+            return rung, ladder[rung - 1]
+        return rung, None
 
     def is_drawdown_breach(self, equity):
         """权益距高水位回撤是否超过 MAX_DRAWDOWN。"""

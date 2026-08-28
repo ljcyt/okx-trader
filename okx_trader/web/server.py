@@ -30,7 +30,8 @@ _LIMIT_KEYS = ("SYMBOLS", "MAX_RISK_PER_TRADE", "MAX_TOTAL_LEVERAGE",
                "MAX_OPEN_POSITIONS", "MAX_DRAWDOWN", "MIN_RR", "MIN_TARGET_ATR",
                "TARGET_ATR_MULT", "ATR_BAR", "ATR_STOP_MULT", "LEVERAGE",
                "TRAIL_ATR_MULT", "MAX_HOLD_BARS", "SCORE_THRESHOLD",
-               "LOOP_INTERVAL_SEC")
+               "LOOP_INTERVAL_SEC", "RISK_TICK_SEC", "DRAWDOWN_LADDER",
+               "FACTOR_GATE")
 
 
 def _ok(**kw):
@@ -159,6 +160,12 @@ def create_app(cfg, store, loop=None):
         out = {
             "env": loop.env.name if loop else cfg.TRADING_ENV,
             "executing": bool(loop.executing) if loop else False,
+            "dd_rung": {"level": loop.risk.state.get_rung() if loop else 0,
+                        "ladder": getattr(cfg, "DRAWDOWN_LADDER", [])},
+            "risk_ticks": int(store.state_get(
+                cfg.TRADING_ENV, "risk_ticks") or 0),
+            "last_risk_tick_ts": store.state_get(cfg.TRADING_ENV,
+                                                 "last_risk_tick_ts"),
             "loop": {
                 "attached": loop is not None,
                 "running": bool(loop and loop.last_snapshot),
@@ -279,6 +286,68 @@ def create_app(cfg, store, loop=None):
             "SELECT * FROM orders ORDER BY created_ts DESC LIMIT ? OFFSET ?",
             [size, (page - 1) * size])
         return _ok(total=total, page=page, size=size, items=[dict(x) for x in rows])
+
+    # ── 因子动物园 / 模型路由（Phase 7/9）────────────────────────────
+
+    @app.get("/api/factors")
+    def factors():
+        gate = getattr(cfg, "FACTOR_GATE", {}) or {}
+        counts = {"observing": 0, "trial": 0, "active": 0,
+                  "retired": 0, "rejected": 0}
+        items = []
+        for d in store.query("SELECT * FROM factor_defs ORDER BY name"):
+            counts[d["status"]] = counts.get(d["status"], 0) + 1
+            s = store.query_one(
+                "SELECT * FROM factor_scores WHERE factor=? "
+                "ORDER BY computed_ts DESC LIMIT 1", (d["name"],))
+            items.append({
+                "name": d["name"], "family": d["family"], "tier": d["tier"],
+                "status": d["status"],
+                "ic": s["ic"] if s else None,
+                "rank_ic": s["rank_ic"] if s else None,
+                "ic_t": s["ic_t"] if s else None,
+                "hit_rate": s["hit_rate"] if s else None,
+                "n_obs": s["n_obs"] if s else 0,
+                "days_tracked": s["days_tracked"] if s else 0,
+                "gate_passed": bool(s["gate_passed"]) if s else False,
+            })
+        return _ok(counts=counts, gate=gate, items=items)
+
+    @app.get("/api/factors/<name>")
+    def factor_detail(name):
+        d = store.query_one("SELECT * FROM factor_defs WHERE name=?", (name,))
+        if not d:
+            return _err("not found", 404)
+        horizon = bottle.request.query.get("horizon") or "1b"
+        series = store.query(
+            "SELECT * FROM factor_scores WHERE factor=? AND horizon=? "
+            "ORDER BY computed_ts ASC", (name, horizon))
+        recent = store.query(
+            "SELECT bar_ts, value, fwd_ret_1b FROM factor_obs WHERE factor=? "
+            "ORDER BY bar_ts DESC LIMIT 30", (name,))
+        return _ok(defn=dict(d), horizon=horizon,
+                   series=[dict(s) for s in series],
+                   recent=[dict(o) for o in recent])
+
+    @app.get("/api/routes")
+    def routes():
+        out = []
+        if loop:
+            llm = loop.committee.llm
+            for role in sorted(set(list(getattr(cfg, "LLM_ROUTES", {}) or {})
+                                   + list(llm.backends))):
+                prefix = role.split(":")[0] + "%"
+                last = store.query_one(
+                    "SELECT model FROM llm_calls WHERE role LIKE ? AND ok=1 "
+                    "ORDER BY id DESC LIMIT 1", (prefix,))
+                fails = store.query_one(
+                    "SELECT COUNT(*) c FROM llm_calls WHERE role LIKE ? AND ok=0 "
+                    "AND id > (SELECT COALESCE(MAX(id),0) FROM llm_calls "
+                    "WHERE role LIKE ? AND ok=1)", (prefix, prefix))
+                out.append({"role": role, "chain": llm.chain_for(role),
+                            "last_answered_by": last["model"] if last else None,
+                            "fail_streak": fails["c"]})
+        return _ok(routes=out)
 
     @app.get("/api/events")
     def events():

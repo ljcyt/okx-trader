@@ -130,6 +130,40 @@ def cmd_migrate(args):
     return 0
 
 
+def cmd_backfill(args):
+    from .config import load_config
+    from .env import make_client, resolve_env
+    from .store.db import Store
+    from .store.factors_zoo import backfill_returns
+    from .env import db_path
+    cfg = _build_cfg(args)
+    store = Store(db_path())
+    client = make_client(resolve_env(cfg), cfg)
+    n = backfill_returns(store, client, bar=cfg.ATR_BAR)
+    print(f"回填完成：{n} 个前向收益")
+    return 0
+
+
+def cmd_score_factors(args):
+    import json as _json
+    from .config import load_config
+    from .store.db import Store
+    from .store.factors_zoo import score_factors
+    from .env import db_path
+    cfg = _build_cfg(args)
+    store = Store(db_path())
+    rows = score_factors(store, getattr(cfg, "FACTOR_GATE", {}), bar=cfg.ATR_BAR)
+    for r in rows:
+        print(f"{r['factor']:>14} {r['horizon']:>4} n={r['n_obs']:>5} "
+              f"ic={_fmtv(r['ic'])} rank_ic={_fmtv(r['rank_ic'])} "
+              f"days={r['days_tracked']} gate={'PASS' if r['gate_passed'] else '—'}")
+    return 0
+
+
+def _fmtv(v):
+    return f"{v:+.4f}" if v is not None else "  —   "
+
+
 def cmd_check_env(args):
     from .check import run_checks
     return run_checks()
@@ -187,6 +221,12 @@ def main(argv=None):
     p = sub.add_parser("migrate", help="旧 JSON 记录 → SQLite")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_migrate)
+
+    p = sub.add_parser("backfill-returns", help="因子观测的前向收益回填")
+    p.set_defaults(fn=cmd_backfill)
+
+    p = sub.add_parser("score-factors", help="因子 IC 打分与晋级判定")
+    p.set_defaults(fn=cmd_score_factors)
 
     p = sub.add_parser("check-env", help="环境自检（联网）")
     p.set_defaults(fn=cmd_check_env)

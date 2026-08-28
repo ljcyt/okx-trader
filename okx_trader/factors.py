@@ -14,6 +14,29 @@ import re
 import time
 
 
+def regime_label(report, cfg):
+    """市况标签（代码判定，不问模型）：
+    adx_proxy = |EMA20-EMA60|/ATR —— 趋势强度的廉价代理。"""
+    atr = report.get("atr") or 0
+    adx_proxy = 0.0
+    if atr and report.get("ema20") is not None and report.get("ema60") is not None:
+        adx_proxy = abs(report["ema20"] - report["ema60"]) / atr
+    if report.get("atr_pct", 0) > getattr(cfg, "HIGH_VOL_ATR_PCT", 0.03):
+        return "high_vol"
+    if adx_proxy > getattr(cfg, "TREND_THRESHOLD", 0.45):
+        return "trending"
+    return "ranging"
+
+
+def overall_regime(factors, cfg):
+    """多标的整体 regime：逐标的判定后投票（平票取第一）。"""
+    from collections import Counter
+    labels = [regime_label(r, cfg) for r in (factors or {}).values() if r]
+    if not labels:
+        return None
+    return Counter(labels).most_common(1)[0][0]
+
+
 def _bar_seconds(bar):
     """"1H"/"15m"/"4D" 之类的周期串 → 秒数；不认识返回 None。"""
     m = re.match(r"^(\d+)([mHdD])$", str(bar))

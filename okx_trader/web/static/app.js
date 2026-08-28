@@ -59,6 +59,15 @@ async function renderOverview() {
     <div class="card tile"><div class="v">${(state.positions || []).length}</div><div class="k">当前持仓</div></div>
     <div class="card tile"><div class="v">${state.loop.rounds_done}</div><div class="k">本轮进程轮数</div></div>
   </div>`;
+  // 回撤档位 + 机械 tick（Phase 8）
+  const rung = state.dd_rung || {level: 0, ladder: []};
+  const tickAgo = state.last_risk_tick_ts ?
+    Math.round(Date.now() / 1000 - state.last_risk_tick_ts) : null;
+  html += `<div class="healthbar">回撤档位：第 ${rung.level} 档` +
+    (rung.ladder && rung.level > 0 ?
+      `（risk_mult=${esc(JSON.stringify(rung.ladder[rung.level - 1].risk_mult))}）` : "") +
+    ` · 风 控 tick：${state.risk_ticks || 0} 次` +
+    (tickAgo !== null ? `（${tickAgo}s 前）` : "") + `</div>`;
 
   html += `<div class="card"><h3>当前持仓</h3>`;
   const pos = state.positions || [];
@@ -299,11 +308,13 @@ function judgeRows(d) {
 async function renderTrades() {
   const [data, stats] = await Promise.all([
     api("/api/trades?size=100"), api("/api/stats")]);
+  const net = stats.net_pnl !== undefined ? stats.net_pnl :
+    (stats.sum_pnl || 0) - (stats.llm_cost_total || 0);
   let html = `<div class="tiles">
-    <div class="card tile"><div class="v ${stats.sum_pnl >= 0 ? "up" : "down"}">${fmt(stats.sum_pnl)}</div><div class="k">总盈亏 USDT（已平）</div></div>
-    <div class="card tile"><div class="v">${stats.win_rate === null ? "—" : pct(stats.win_rate)}</div><div class="k">胜率</div></div>
-    <div class="card tile"><div class="v">${fmt(stats.avg_r)}R</div><div class="k">平均 R</div></div>
-    <div class="card tile"><div class="v">${fmt(stats.best)} / ${fmt(stats.worst)}</div><div class="k">最好 / 最差</div></div>
+    <div class="card tile"><div class="v ${stats.sum_pnl >= 0 ? "up" : "down"}">${fmt(stats.sum_pnl)}</div><div class="k">交易盈亏 USDT（已平）</div></div>
+    <div class="card tile"><div class="v down">−${fmt(stats.llm_cost_total, 3)}</div><div class="k">模型成本 USD${stats.llm_cost_total === 0 ? "（未计价模型不累计）" : ""}</div></div>
+    <div class="card tile"><div class="v ${net >= 0 ? "up" : "down"}">${fmt(net)}</div><div class="k">净额（盈亏 − 模型成本）</div></div>
+    <div class="card tile"><div class="v">${stats.win_rate === null ? "—" : pct(stats.win_rate)}</div><div class="k">胜率 · 平均 ${fmt(stats.avg_r)}R</div></div>
   </div>`;
   html += `<div class="card"><h3>交易记录（${data.total}）</h3>`;
   if (!data.items.length) html += `<div class="muted">还没有交易——纸面/回放模式不产生真实成交</div>`;
@@ -367,6 +378,31 @@ async function renderEvents() {
   $("#app").innerHTML = html;
 }
 
+/* ── 因子动物园 ───────────────────────────────────────── */
+async function renderFactors() {
+  const data = await api("/api/factors");
+  const c = data.counts;
+  let html = `<div class="card"><h3>因子动物园 · core ${c.core || 0} · observing ${c.observing || 0} ·
+    trial ${c.trial || 0} · active ${c.active || 0} · retired ${c.retired || 0} · rejected ${c.rejected || 0}</h3>
+    <div class="muted">晋级门槛：${data.gate.scored_days || 15}+ 计分日 · ${data.gate.days_tracked || 30}+ 天 tracked ·
+    正 rank-IC —— 未晋级的因子不影响下单（unproven edge never touches the book）</div>
+    <table style="margin-top:10px"><thead><tr><th>因子</th><th>族</th><th>层</th><th>状态</th>
+    <th>IC</th><th>rank-IC</th><th>命中率</th><th>观测数</th><th>tracked 天数</th></tr></thead><tbody>`;
+  for (const f of data.items) {
+    html += `<tr><td><b>${esc(f.name)}</b></td><td>${esc(f.family)}</td><td>${esc(f.tier)}</td>
+      <td><span class="chip ${f.status === "active" || f.status === "trial" ? "opened" : f.status === "rejected" || f.status === "retired" ? "risk_rejected" : "no_action"}">${esc(f.status)}</span></td>
+      <td class="num">${fmt(f.ic, 3)}</td>
+      <td class="num">${fmt(f.rank_ic, 3)}</td>
+      <td class="num">${f.hit_rate === null ? "—" : pct(f.hit_rate)}</td>
+      <td class="num">${fmt(f.n_obs, 0)}</td>
+      <td class="num">${fmt(f.days_tracked, 0)}</td></tr>`;
+  }
+  if (!data.items.length)
+    html += `<tr><td colspan="9" class="muted">尚无观测——跑几轮 run-loop 后回来</td></tr>`;
+  html += `</tbody></table></div>`;
+  $("#app").innerHTML = html;
+}
+
 /* ── 路由 ─────────────────────────────────────────────── */
 function parseHash() {
   const h = (location.hash || "#/overview").slice(2);
@@ -387,6 +423,7 @@ async function route() {
     if (parts[0] === "rounds") return await renderRounds(query);
     if (parts[0] === "trades" && parts[1]) return await renderTradeDetail(parts[1]);
     if (parts[0] === "trades") return await renderTrades();
+    if (parts[0] === "factors") return await renderFactors();
     if (parts[0] === "events") return await renderEvents();
     return await renderOverview();
   } catch (e) {

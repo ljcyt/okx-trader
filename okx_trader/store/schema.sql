@@ -15,7 +15,13 @@ CREATE TABLE IF NOT EXISTS rounds (
   data_ok INTEGER NOT NULL DEFAULT 1,     -- 0 = 全标的因子失败（"没数据"≠"没信号"）
   symbols_ok INTEGER NOT NULL DEFAULT 0, symbols_total INTEGER NOT NULL DEFAULT 0,
   equity REAL, hwm REAL, drawdown REAL, usdt_avail REAL,
-  open_positions INTEGER NOT NULL DEFAULT 0, duration_sec REAL, error TEXT
+  open_positions INTEGER NOT NULL DEFAULT 0, duration_sec REAL, error TEXT,
+  round_type TEXT,                        -- cognition|event|evolution
+  intent TEXT,                            -- deploy|steady|place|hold
+  final_action TEXT,                      -- deploy|steady|place|revise
+  regime TEXT,                            -- trending|ranging|high_vol
+  advisor_endorsed TEXT,                  -- '2/3'
+  revisions INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_ts     ON rounds(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_rounds_status ON rounds(status, ts DESC);
@@ -141,7 +147,8 @@ CREATE TABLE IF NOT EXISTS llm_calls (
   role TEXT NOT NULL,        -- 'analyst:趋势猎手' | 'judge:风控裁判'
   model TEXT, ok INTEGER NOT NULL, err TEXT,
   latency_ms INTEGER, prompt_tokens INTEGER, completion_tokens INTEGER,
-  raw_reply TEXT             -- 原始回复：JSON 解析失败时唯一的线索
+  raw_reply TEXT,            -- 原始回复：JSON 解析失败时唯一的线索
+  cost_usd REAL              -- 按价目表折算；缺价模型为 NULL（不能拿 0 当已知）
 );
 CREATE INDEX IF NOT EXISTS idx_llm_round ON llm_calls(round_pk);
 
@@ -155,3 +162,45 @@ CREATE TABLE IF NOT EXISTS app_events (
   message TEXT NOT NULL, detail_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ev_kind ON app_events(kind, ts DESC);
+
+-- ── 因子动物园（Phase 7）：unproven edge never touches the book ──────────────
+
+CREATE TABLE IF NOT EXISTS factor_defs (
+  name        TEXT PRIMARY KEY,      -- 'rsi14' / 'funding_rate' ...
+  family      TEXT NOT NULL,         -- momentum|reversal|breakout|carry|volatility|microstructure
+  tier        TEXT NOT NULL,         -- core|derived
+  status      TEXT NOT NULL,         -- candidate|observing|trial|active|retired|rejected
+  source      TEXT NOT NULL,         -- 'builtin' —— 本期只有内置因子
+  created_ts  REAL NOT NULL,
+  status_ts   REAL NOT NULL,
+  status_note TEXT
+);
+
+CREATE TABLE IF NOT EXISTS factor_obs (
+  factor     TEXT NOT NULL REFERENCES factor_defs(name) ON DELETE CASCADE,
+  inst_id    TEXT NOT NULL,
+  bar_ts     INTEGER NOT NULL,       -- 已收盘 K 线时间戳(ms)，对齐的唯一依据
+  round_pk   INTEGER REFERENCES rounds(id) ON DELETE SET NULL,
+  value      REAL NOT NULL,
+  fwd_ret_1b REAL, fwd_ret_4b REAL, fwd_ret_24b REAL,   -- 回填
+  filled_ts  REAL,
+  PRIMARY KEY (factor, inst_id, bar_ts)                 -- 天然幂等，重跑不产生重复
+);
+CREATE INDEX IF NOT EXISTS idx_fo_pending ON factor_obs(factor, filled_ts) WHERE filled_ts IS NULL;
+CREATE INDEX IF NOT EXISTS idx_fo_bar     ON factor_obs(bar_ts);
+
+CREATE TABLE IF NOT EXISTS factor_scores (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  factor       TEXT NOT NULL REFERENCES factor_defs(name) ON DELETE CASCADE,
+  horizon      TEXT NOT NULL,        -- '1b'|'4b'|'24b'
+  computed_ts  REAL NOT NULL,
+  n_obs        INTEGER NOT NULL,     -- 参与计算的观测数
+  scored_days  INTEGER NOT NULL,     -- 有前向收益的自然日数
+  days_tracked INTEGER NOT NULL,     -- 从 created_ts 起的自然日数
+  ic           REAL,                 -- Pearson(value, fwd_ret)
+  rank_ic      REAL,                 -- Spearman
+  ic_t         REAL,                 -- ic * sqrt(n_obs - 2) / sqrt(1 - ic^2)
+  hit_rate     REAL,                 -- sign(value)==sign(fwd_ret) 的占比
+  gate_passed  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_fs_latest ON factor_scores(factor, horizon, computed_ts DESC);

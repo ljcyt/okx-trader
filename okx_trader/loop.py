@@ -22,14 +22,27 @@ from . import __version__
 from .committee import Committee
 from .exits import manage_open_positions, open_trade_row, reconcile_closed_trade
 from .env import ENVS, db_path, make_client, resolve_env
-from .factors import build_factor_report, format_factor_report
+from .factors import (build_factor_report, format_factor_report,
+                      overall_regime)
 from .hooks import register as hook_register, trigger as hook_trigger
 from .risk import RiskManager
 from .store import write as w
 from .store.db import Store, init_db
+from .store.factors_zoo import backfill_returns, collect_from_report
 
 
 _hooks_wired = False
+
+
+class _TickWriter:
+    """tick 的写库适配：订单/事件 round_pk=NULL（不属于任何 cognition 轮）。"""
+    pk = None
+
+    def __init__(self, store):
+        self.store = store
+
+    def write_order(self, env, inst_id, kind, ord_type, **kw):
+        w.write_order(self.store, env, inst_id, kind, ord_type, **kw)
 
 
 class RunState:
@@ -49,6 +62,20 @@ class RunState:
         self.store.state_set(self.env, "equity_hwm", hwm)
         dd = (hwm - float(equity)) / hwm if hwm > 0 else 0.0
         return hwm, dd
+
+    # 回撤档位（tick 评估，滞回降档）
+    def get_rung(self):
+        v = self.store.state_get(self.env, "dd_rung")
+        return int(v) if v else 0
+
+    def set_rung(self, rung):
+        self.store.state_set(self.env, "dd_rung", int(rung))
+
+    def get_paused(self):
+        return bool(self.store.state_get(self.env, "paused"))
+
+    def set_paused_state(self, paused):
+        self.store.state_set(self.env, "paused", bool(paused))
 
     # 持仓元数据（崩溃对账用）
     def get_positions_meta(self):
@@ -70,13 +97,14 @@ class TradingLoop:
         self.executing = self.env.executing if executing is None else executing
 
         self.store = store or Store(db_path=self._db_path())
+        self.state = RunState(self.store, self.env.name)   # run_state 适配器
         self.client = make_client(self.env, self.cfg, logger=self.log)
         self.risk = RiskManager(self.cfg, self.client,
-                                RunState(self.store, self.env.name))
+                                self.state)
         self.committee = Committee(self.cfg, self.client, store=self.store,
                                    env=self.env.name)
         self.round_seq = 0
-        self.paused = False
+        self.paused = bool(self.state.get_paused())  # 末档熔断后的人工恢复
         self._wire_alert_hooks()
         self.last_snapshot = None       # Web 面板读的活状态
         self.next_round_ts = None
@@ -118,12 +146,14 @@ class TradingLoop:
     def request_run_now(self):
         self._run_now.set()
 
-    def set_paused(self, paused):
+    def set_paused(self, paused, reason=""):
         self.paused = bool(paused)
+        self.state.set_paused_state(self.paused)
         w.write_event(self.store, self.env.name,
                       "paused" if paused else "resumed",
-                      "循环已暂停" if paused else "循环已恢复",
-                      level="info")
+                      f"循环已{'暂停' if paused else '恢复'}"
+                      + (f"（{reason}）" if reason else ""),
+                      level="warn" if paused else "info")
 
     # ────────────────────────── 快照 ──────────────────────────
 
@@ -181,10 +211,12 @@ class TradingLoop:
         llm_mode = "llm" if self.committee.llm.available else "baseline"
         rw = w.RoundWriter.open(self.store, round_id, t0, self.env.name,
                                 self.executing, llm_mode)
-        # LLM 调用记账挂到本轮
+        # LLM 调用记账挂到本轮（含成本）
         self.committee.llm.recorder = (
-            lambda role, model, ok, err, lat, raw, _pk=rw.pk:
-            w.write_llm_call(self.store, _pk, role, model, ok, err, lat, None, None, raw))
+            lambda role, model, ok, err, lat, raw, pt=None, ct=None, cost=None,
+            _pk=rw.pk:
+            w.write_llm_call(self.store, _pk, role, model, ok, err, lat, pt,
+                             ct, raw, cost_usd=cost))
 
         out = {"round_id": round_id, "status": "error", "env": self.env.name,
                "executing": self.executing}
@@ -193,9 +225,17 @@ class TradingLoop:
         try:
             # 1. 快照
             snap = self.take_snapshot()
-            # 2. 持仓巡检/对账 + 退出管理（移动/时间止损）
+            # 2. 持仓巡检/对账（移动/时间止损已挪到 5 分钟 tick，见 risk_tick）
             self._patrol_positions(snap, rw)
-            manage_open_positions(self, snap, rw)
+            # 2.5 因子动物园：前向收益回填 + 本轮观测采集（都幂等，失败不影响交易）
+            try:
+                backfill_returns(self.store, self.client, bar=self.cfg.ATR_BAR)
+                for inst_id, f in snap["factors"].items():
+                    if f:
+                        collect_from_report(self.store, rw.pk, inst_id, f,
+                                            self.cfg.ATR_BAR)
+            except Exception:  # noqa: BLE001
+                self.log.debug("因子动物园采集/回填失败", exc_info=True)
             # 因子快照全量入库
             for inst_id, f in snap["factors"].items():
                 rw.write_factors(
@@ -232,6 +272,14 @@ class TradingLoop:
             slot_pks = rw.write_committee(decision, self.committee.threshold)
             plan = decision.get("plan") if decision.get("action") == "open" else None
             out["decision"] = decision.get("reason")
+            # Phase 10 轮次词汇：intent（想做什么）/ final_action（实际做了什么）
+            regime = overall_regime(snap["factors"], self.cfg)
+            adv = next((s.get("votes") for s in decision.get("scoreboard", [])
+                        if plan and s.get("instId") == plan.get("instId")
+                        and s.get("direction") == plan.get("direction")
+                        and s.get("analyst") == plan.get("analyst")), None)
+            revisions = int(decision.get("revisions") or 0)
+            out["regime"] = regime
             if plan is None:
                 rw.finish("no_action", reason=decision.get("reason"),
                           data_ok=1, symbols_ok=snap["symbols_ok"],
@@ -239,7 +287,9 @@ class TradingLoop:
                           equity=snap["equity"], hwm=snap["hwm"],
                           drawdown=snap["drawdown"], usdt_avail=snap["usdt_avail"],
                           open_positions=len(snap["positions"]),
-                          duration_sec=round(time.time() - t0, 2))
+                          duration_sec=round(time.time() - t0, 2),
+                          intent="hold", final_action="steady", regime=regime,
+                          advisor_endorsed=adv, revisions=revisions)
                 out["status"] = "no_action"
                 return out
 
@@ -261,7 +311,11 @@ class TradingLoop:
                           equity=snap["equity"], hwm=snap["hwm"],
                           drawdown=snap["drawdown"], usdt_avail=snap["usdt_avail"],
                           open_positions=len(snap["positions"]),
-                          duration_sec=round(time.time() - t0, 2))
+                          duration_sec=round(time.time() - t0, 2),
+                          intent="place",
+                          final_action="revise" if revisions else "steady",
+                          regime=regime, advisor_endorsed=adv,
+                          revisions=revisions)
                 out.update({"status": "risk_rejected", "failures": verdict.failures})
                 if any("熔断" in f for f in verdict.failures):
                     w.write_event(self.store, self.env.name, "circuit_breaker",
@@ -289,7 +343,10 @@ class TradingLoop:
                       equity=snap["equity"], hwm=snap["hwm"],
                       drawdown=snap["drawdown"], usdt_avail=snap["usdt_avail"],
                       open_positions=len(snap["positions"]),
-                      duration_sec=round(time.time() - t0, 2))
+                      duration_sec=round(time.time() - t0, 2),
+                      intent="place",
+                      final_action="deploy" if status == "opened" else "place",
+                      regime=regime, advisor_endorsed=adv, revisions=revisions)
             out.update({"status": status, "execution": execution})
             if status == "opened":
                 hook_trigger("order_filled", {"kind": "order_filled", "level": "info",
@@ -560,39 +617,138 @@ class TradingLoop:
     # ────────────────────────── 循环 ──────────────────────────
 
     def run(self, interval_sec=None, max_rounds=None, on_round=None):
-        """定时循环。on_round(result) 回调供 Web 层展示实时状态。"""
+        """双层调度：cognition round（默认 1h）+ 机械 risk tick（默认 5min），
+        同线程串行；撞点时 round 先跑（它开头本来就含一次巡检，不重复）。"""
         interval = interval_sec or getattr(self.cfg, "LOOP_INTERVAL_SEC", 3600)
-        self.log.info("交易循环启动：每 %ds 一轮%s，env=%s executing=%s",
-                      interval,
-                      f"，共 {max_rounds} 轮" if max_rounds else "，持续运行",
-                      self.env.name, self.executing)
+        tick_sec = int(getattr(self.cfg, "RISK_TICK_SEC", 300) or 0)
+        self.log.info("交易循环启动：round 每 %ds，tick 每 %ds，env=%s executing=%s",
+                      interval, tick_sec, self.env.name, self.executing)
+        next_round_at = time.time()      # 立即跑第一轮
+        next_tick_at = time.time() + (tick_sec or interval)
         n = 0
         try:
             while max_rounds is None or n < max_rounds:
                 if self.paused:
                     time.sleep(2)
                     continue
-                n += 1
-                self.current_step = "running"
-                result = self.run_round()
-                self.current_step = None
-                if on_round:
+                now = time.time()
+                if now >= next_round_at:
+                    n += 1
+                    self.current_step = "running"
                     try:
-                        on_round(result)
+                        result = self.run_round()
+                    finally:
+                        self.current_step = None
+                    if on_round:
+                        try:
+                            on_round(result)
+                        except Exception:  # noqa: BLE001
+                            self.log.debug("on_round 回调失败", exc_info=True)
+                    next_round_at = time.time() + interval
+                    # round 已含巡检：tick 顺延，避免重复巡检
+                    next_tick_at = max(next_tick_at, time.time() + tick_sec)
+                    self.next_round_ts = next_round_at
+                elif tick_sec and now >= next_tick_at:
+                    try:
+                        self.risk_tick()
                     except Exception:  # noqa: BLE001
-                        self.log.debug("on_round 回调失败", exc_info=True)
-                if max_rounds is not None and n >= max_rounds:
-                    break
-                self.next_round_ts = time.time() + interval
-                # 分片睡眠：暂停与 run-now 都能尽快生效
-                slept = 0
-                while slept < interval and not self.paused:
+                        self.log.error("risk tick 异常：%s", traceback.format_exc())
+                    next_tick_at = time.time() + tick_sec
+                else:
+                    nxt = min(next_round_at, next_tick_at)
+                    chunk = min(2.0, max(0.1, nxt - time.time()))
+                    time.sleep(chunk)
                     if self._run_now.is_set():
                         self._run_now.clear()
-                        break
-                    chunk = min(5, interval - slept)
-                    time.sleep(chunk)
-                    slept += chunk
-                self.next_round_ts = None
+                        next_round_at = time.time()
         except KeyboardInterrupt:
             self.log.info("收到中断，交易循环停止")
+
+    def risk_tick(self):
+        """5 分钟机械风控 tick（不花 LLM）：巡检保护单、移动/时间止损、
+        回撤阶梯、权益采样。只做 3 类只读调用 + 必要时的撤挂单。"""
+        if self.paused:
+            return
+        positions = self.client.get_positions()
+        tick_rw = _TickWriter(self.store)
+        # ATR 用最近一轮的因子值（避免每 tick 重复拉 K 线）
+        factors = {}
+        for p in positions:
+            row = self.store.query_one(
+                "SELECT atr, price FROM round_factors WHERE inst_id=? AND ok=1 "
+                "ORDER BY round_pk DESC LIMIT 1", (p["instId"],))
+            if row:
+                factors[p["instId"]] = {"atr": row["atr"], "price": row["price"]}
+        snap = {"positions": positions, "factors": factors}
+        self._patrol_positions(snap, tick_rw)
+        manage_open_positions(self, snap, tick_rw)
+        self._evaluate_drawdown_ladder(tick_rw)
+        try:  # 权益采样（round_pk NULL → 面板分钟级曲线）
+            eq = self.client.get_equity()
+            hwm, dd = self.risk.state.update_hwm(eq["total_eq"])
+            w.write_equity(self.store, self.env.name, time.time(),
+                           eq["total_eq"], hwm, dd, eq["usdt_avail"], None,
+                           len(positions))
+        except Exception:  # noqa: BLE001
+            self.log.debug("tick 权益采样失败", exc_info=True)
+        ticks = int(self.store.state_get(self.env.name, "risk_ticks") or 0) + 1
+        self.store.state_set(self.env.name, "risk_ticks", ticks)
+        self.store.state_set(self.env.name, "last_risk_tick_ts", time.time())
+
+    def _evaluate_drawdown_ladder(self, rw):
+        """回撤阶梯（升档立即生效；降档需回撤 < 当前档阈值 80%，防抖动）。"""
+        ladder = list(getattr(self.cfg, "DRAWDOWN_LADDER", []) or [])
+        equity = (self.last_snapshot or {}).get("equity")
+        hwm = (self.last_snapshot or {}).get("hwm")
+        if not ladder or not equity or not hwm:
+            return
+        drawdown = (hwm - equity) / hwm
+        rung = self.risk.state.get_rung()
+
+        target = 0
+        for i, t in enumerate(ladder):
+            if drawdown >= t.get("dd", 1):
+                target = i + 1
+        if target > rung:  # 升档立即
+            self.risk.state.set_rung(target)
+            tier = ladder[target - 1]
+            msg = (f"回撤 {drawdown:.1%} 触发第 {target} 档"
+                   f"（阈值 {tier.get('dd'):.0%}，risk_mult={tier.get('risk_mult')}，"
+                   f"allow_open={tier.get('allow_open')}）")
+            w.write_event(self.store, self.env.name, "circuit_breaker", msg,
+                          level="warn", round_pk=getattr(rw, "pk", None))
+            hook_trigger("circuit_breaker", {"kind": "circuit_breaker",
+                         "level": "warn", "message": msg})
+            self.log.warning("回撤阶梯：%s", msg)
+            if tier.get("flatten"):
+                self._flatten_all(rw)
+        elif target < rung:  # 降档滞回
+            cur_threshold = ladder[rung - 1].get("dd", 1)
+            if drawdown < cur_threshold * 0.8:
+                self.risk.state.set_rung(target)
+                w.write_event(self.store, self.env.name, "circuit_breaker",
+                              f"回撤回落至 {drawdown:.1%}（低于 {cur_threshold:.0%} "
+                              f"的 80%），降档到第 {target} 档", level="info",
+                              round_pk=getattr(rw, "pk", None))
+                self.log.info("回撤阶梯降档：%.1f%% → 第 %d 档", drawdown * 100,
+                              target)
+
+    def _flatten_all(self, rw):
+        """末档：市价平掉全部持仓 + 撤全部挂单 + 停机待人工恢复。"""
+        self.log.critical("回撤阶梯末档：全平并停机待人工恢复！")
+        for o in self.client.get_pending_orders():
+            try:
+                self.client.cancel_order(o["instId"], o["ordId"])
+            except Exception:  # noqa: BLE001
+                pass
+        for p in self.client.get_positions():
+            try:
+                self.client.close_position_market(p["instId"], p["direction"])
+            except Exception as e:  # noqa: BLE001
+                self.log.critical("强平 %s 失败：%s —— 请人工处理！", p["instId"], e)
+        w.write_event(self.store, self.env.name, "circuit_breaker",
+                      "末档触发：全部持仓已市价平掉、挂单已撤，循环暂停待人工恢复",
+                      level="critical")
+        hook_trigger("circuit_breaker", {"kind": "circuit_breaker",
+                     "level": "critical", "message": "末档全平并停机"})
+        self.set_paused(True, "回撤阶梯末档")

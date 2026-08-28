@@ -29,14 +29,19 @@ class RoundWriter:
 
     def finish(self, status, action=None, reason=None, data_ok=1, symbols_ok=0,
                symbols_total=0, equity=None, hwm=None, drawdown=None,
-               usdt_avail=None, open_positions=0, duration_sec=None, error=None):
+               usdt_avail=None, open_positions=0, duration_sec=None, error=None,
+               round_type="cognition", intent=None, final_action=None,
+               regime=None, advisor_endorsed=None, revisions=0):
         self.store.execute(
             "UPDATE rounds SET status=?, action=?, reason=?, data_ok=?, "
             "symbols_ok=?, symbols_total=?, equity=?, hwm=?, drawdown=?, "
-            "usdt_avail=?, open_positions=?, duration_sec=?, error=? WHERE id=?",
+            "usdt_avail=?, open_positions=?, duration_sec=?, error=?, "
+            "round_type=?, intent=?, final_action=?, regime=?, "
+            "advisor_endorsed=?, revisions=? WHERE id=?",
             (status, action, reason, int(data_ok), symbols_ok, symbols_total,
              equity, hwm, drawdown, usdt_avail, open_positions, duration_sec,
-             error, self.pk))
+             error, round_type, intent, final_action, regime,
+             advisor_endorsed, revisions, self.pk))
 
     # ── 因子快照（完整 report_json + report_text）────────────────────
 
@@ -195,6 +200,16 @@ class RoundWriter:
              _json(detail) if detail else None))
 
 
+def write_equity(store, env, ts, equity, hwm, drawdown, usdt_avail=None,
+                 upl=None, open_positions=0, round_pk=None):
+    """模块级权益采样（tick 用，round_pk=NULL）；RoundWriter.write_equity 走轮次。"""
+    store.execute(
+        "INSERT OR IGNORE INTO equity_curve(env, ts, round_pk, equity, hwm, "
+        "drawdown, usdt_avail, upl, open_positions) VALUES (?,?,?,?,?,?,?,?,?)",
+        (env, ts, round_pk, equity, hwm, drawdown, usdt_avail, upl,
+         open_positions))
+
+
 def write_event(store, env, kind, message, level="info", inst_id=None,
                 round_pk=None, detail=None):
     """不挂在轮次上的事件（登录、环境切换、暂停……）。"""
@@ -206,9 +221,11 @@ def write_event(store, env, kind, message, level="info", inst_id=None,
 
 
 def write_llm_call(store, round_pk, role, model, ok, err=None, latency_ms=None,
-                   prompt_tokens=None, completion_tokens=None, raw_reply=None):
+                   prompt_tokens=None, completion_tokens=None, raw_reply=None,
+                   cost_usd=None):
     store.execute(
         "INSERT INTO llm_calls(round_pk, role, model, ok, err, latency_ms, "
-        "prompt_tokens, completion_tokens, raw_reply) VALUES (?,?,?,?,?,?,?,?,?)",
+        "prompt_tokens, completion_tokens, raw_reply, cost_usd) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
         (round_pk, role, model, int(ok), err, latency_ms, prompt_tokens,
-         completion_tokens, raw_reply))
+         completion_tokens, raw_reply, cost_usd))

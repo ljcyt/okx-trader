@@ -14,9 +14,47 @@ LLM 模式：每个 agent 独立调用模型（同一模型不同人设 prompt�
 import time
 
 from .llm import LLMClient
+from .store import write as w
 
 # 裁判法定人数：有效票不足此数时提案不能胜出（防止 LLM 超时导致单裁判独裁）
 MIN_JUDGE_VOTES = 2
+# 同一人设连续出现幻觉数字达到该次数 → 降为 observing（只记录意见，不参与授权）
+HALLUCINATION_DEMOTE_STREAK = 3
+
+
+def fmt_score(v):
+    return "—" if v is None else f"{float(v):.1f}"
+
+
+def verify_numbers(reason, report_text, own=(), tol=0.005):
+    """防幻觉闸门（代码做，不靠模型自觉）：
+    提案 reason 里引用的数字必须能在该标的因子报告原文里找到
+    （±0.5% 相对误差）；自己算出的字段（止损价/入场价/置信度）豁免。
+    返回对不上号的数字列表。"""
+    import re
+
+    def _num(s):
+        try:
+            return float(str(s).rstrip("%"))
+        except (ValueError, TypeError):
+            return None
+
+    cited = re.findall(r"-?\d+\.?\d*%?", str(reason or ""))
+    pool = [_num(t) for t in re.findall(r"-?\d+\.?\d*%?", str(report_text or ""))]
+    pool = [p for p in pool if p is not None]
+    own_vals = [_num(o) for o in own]
+    own_vals = [o for o in own_vals if o is not None]
+    missing = []
+    for c in cited:
+        cv = _num(c)
+        if cv is None:
+            continue
+        if any(abs(cv - t) <= tol * max(abs(cv), abs(t), 1e-9) for t in pool):
+            continue
+        if any(abs(cv - o) <= tol * max(abs(cv), abs(o), 1e-9) for o in own_vals):
+            continue
+        missing.append(c)
+    return missing
 
 # ── 三位分析师：人设与风格 ──────────────────────────────────────────
 ANALYSTS = [
@@ -105,21 +143,31 @@ class Committee:
                     "analysts": analyst_log,
                     "reason": "所有分析师弃权，本轮不交易"}
 
-        # 2. 裁判打分
+        # 2. 裁判打分 + 聚合 + 数字核对 + 修订循环（最多 MAX_REVISIONS 次）
+        max_rev = int(getattr(self.cfg, "MAX_REVISIONS", 1) or 0)
+        revisions = 0
         judging = self._ask_judges(proposals, factor_text, account_ctx, snapshot)
-
-        # 3. 聚合：均分门槛 + 多数决
-        #    有效票数 = 该提案实际收到的裁判分（LLM 裁判失败会缺席）
-        #    通过票数门槛 = floor(有效票/2)+1（即过半；3票时为2）
-        for i, p in enumerate(proposals):
-            rows = [row for row in judging["rows"] if row["idx"] == i]
-            scores = [row["score"] for row in rows]
-            votes = sum(1 for row in rows if row["approved"])
-            p["avg_score"] = round(sum(scores) / len(scores), 2) if scores else 0
-            p["votes"] = f"{votes}/{len(rows) or len(JUDGES)}"
-            p["qualify"] = (len(scores) >= MIN_JUDGE_VOTES
-                            and p["avg_score"] >= self.threshold
-                            and votes * 2 > len(scores))
+        self._aggregate(proposals, judging, snapshot)
+        while (not [p for p in proposals if p.get("qualify")] and proposals
+               and self.llm.available and revisions < max_rev):
+            # 修订循环：全部 concerns 回喂给最高分候选，修订或撤回，重打一次分
+            revisions += 1
+            candidate = max(proposals, key=lambda p: (p["avg_score"],
+                                                      _f(p.get("confidence"))))
+            concerns = [row["concerns"] for row in judging["rows"]
+                        if row["idx"] == proposals.index(candidate)
+                        and row.get("concerns")]
+            revised = self._ask_revision(candidate, concerns, snapshot,
+                                         factor_text, account_ctx, held)
+            if not revised or revised.get("action") != "open":
+                proposals = []      # 撤回
+                break
+            revised["analyst"] = candidate["analyst"]
+            revised["slot"] = candidate.get("slot")
+            proposals = [revised]
+            judging = self._ask_judges(proposals, factor_text, account_ctx,
+                                       snapshot)
+            self._aggregate(proposals, judging, snapshot)
 
         qualified = [p for p in proposals if p.get("qualify")]
         qualified.sort(key=lambda p: (p["avg_score"], _f(p.get("confidence"))), reverse=True)
@@ -128,6 +176,7 @@ class Committee:
             "mode": self.llm_mode_name(),
             "analysts": analyst_log,
             "judging": judging["rows"],
+            "revisions": revisions,
             "scoreboard": [
                 {"analyst": p["analyst"], "instId": p["instId"],
                  "direction": p["direction"], "avg_score": p["avg_score"],
@@ -171,26 +220,141 @@ class Committee:
     def llm_mode_name(self):
         return "llm" if self.llm.available else "baseline"
 
+    def _aggregate(self, proposals, judging, snapshot):
+        """聚合：均分门槛 + 多数决 + 法定票数 + 数字核对扣分。
+
+        数字核对用代码做（不靠模型自觉）：提案 reason 里引用的数字必须能在
+        该标的的因子报告原文里找到（±0.5% 相对误差；自己算出的止损/入场价豁免）。
+        对不上的写 hallucinated_number 事件并扣分；同一人设连续多次出现幻觉
+        自动降为 observing——只记录意见，不再参与授权。
+        """
+        penalty = float(getattr(self.cfg, "HALLUCINATION_PENALTY", 2.0) or 0)
+        factor_texts = {inst: format_one(r)
+                        for inst, r in (snapshot.get("factors") or {}).items()
+                        if r}
+        quorum_short = False
+        for i, p in enumerate(proposals):
+            rows = [row for row in judging["rows"] if row["idx"] == i]
+            scores = [row["score"] for row in rows]
+            votes = sum(1 for row in rows if row["approved"])
+            avg = round(sum(scores) / len(scores), 2) if scores else 0
+            p["votes"] = f"{votes}/{len(rows) or len(JUDGES)}"
+
+            missing = verify_numbers(
+                p.get("reason"),
+                factor_texts.get(p.get("instId"), ""),
+                own=[p.get("stop_loss"), p.get("entry_hint"),
+                     p.get("confidence")])
+            if missing and self.store is not None:
+                avg = round(avg - penalty, 2)
+                p["hallucinated"] = missing
+                streak_key = f"hallu_streak_{p.get('analyst')}"
+                streak = int(self.store.state_get(self.env, streak_key) or 0) + 1
+                self.store.state_set(self.env, streak_key, streak)
+                if streak >= HALLUCINATION_DEMOTE_STREAK:
+                    p["demoted"] = True
+                w.write_event(
+                    self.store, self.env, "hallucinated_number",
+                    f"{p.get('analyst')} 提案引用了因子报告里不存在的数字："
+                    f"{missing}（连续第 {streak} 次）",
+                    level="warn")
+            elif self.store is not None:
+                self.store.state_set(
+                    self.env, f"hallu_streak_{p.get('analyst')}", 0)
+
+            p["avg_score"] = avg
+            p["qualify"] = (len(scores) >= MIN_JUDGE_VOTES
+                            and avg >= self.threshold
+                            and votes * 2 > len(scores)
+                            and not p.get("demoted"))
+            if len(scores) < MIN_JUDGE_VOTES:
+                quorum_short = True
+
+        if quorum_short and self.store is not None:
+            w.write_event(self.store, self.env, "judge_quorum",
+                          "有效裁判票不足法定人数（2），全部提案不授权",
+                          level="warn")
+
+    def _ask_revision(self, candidate, concerns, snapshot, factor_text,
+                      account_ctx, held):
+        """修订循环：裁判否决后把 concerns 回喂给原分析师一次（修订或撤回）。"""
+        if not self.llm.available:
+            return None
+        persona = next((a for a in ANALYSTS if a["name"] == candidate.get("analyst")),
+                       ANALYSTS[0])
+        user = (f"{factor_text}\n\n{account_ctx}\n\n"
+                f"你此前提出：{candidate.get('instId')} {candidate.get('direction')} "
+                f"止损 {candidate.get('stop_loss')}。裁判意见：{concerns}。\n"
+                f"请根据意见修订提案（保留原方向就更新止损与理由；意见成立就撤回）。"
+                f"reason 仍必须以 'Delta: ' 开头说明你改了什么。只输出 JSON：\n"
+                f'修订: {{"action":"open","instId":"...","direction":"long|short",'
+                f'"stop_loss":数字,"confidence":0~1,"reason":"Delta: ..."}}\n'
+                f'撤回: {{"action":"hold","reason":"Delta: ..."}}')
+        try:
+            out = self.llm.chat(persona["prompt"], user, expect_json=True,
+                                role=f"analyst:{persona['name']}")
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("修订调用失败：%s", e)
+            return None
+        if out.get("action") == "open":
+            if not (out.get("instId") in self.cfg.SYMBOLS
+                    and out.get("direction") in ("long", "short")
+                    and float(out.get("stop_loss") or 0) > 0):
+                return None
+            out["stop_loss"] = float(out["stop_loss"])
+            out.setdefault("order_type", "limit_maker")
+        out["revised"] = True
+        return out
+
     def recent_rounds_summary(self, n=8):
-        """轻量记忆/反思：读最近 n 轮的落盘记录，压成几行文字回喂给 LLM agent，
-        让委员会知道自己最近提了什么、结果如何（借鉴 LLM_trader 的历史记忆机制）。"""
+        """轻量记忆/反思：最近 n 轮的提案**及其结果**（盈亏/R倍数/出场原因），
+        加上按人设的累计战绩，回喂给 LLM agent——这是「结果 → 决策」的唯一通路。"""
         if self.store is None:
             return ""
         try:
             rows = self.store.query(
-                "SELECT r.ts, r.status, p.inst_id, p.direction, p.avg_score "
-                "FROM rounds r LEFT JOIN proposals p "
-                "ON p.round_pk = r.id AND p.is_winner = 1 "
+                "SELECT r.ts, r.status, p.analyst, p.inst_id, p.direction, "
+                "       p.avg_score, t.realized_pnl, t.r_multiple, t.exit_reason "
+                "FROM rounds r "
+                "LEFT JOIN proposals p ON p.round_pk = r.id AND p.is_winner = 1 "
+                "LEFT JOIN trades    t ON t.open_round_pk = r.id "
                 "ORDER BY r.ts DESC LIMIT ?", (n,))
         except Exception:  # noqa: BLE001 —— 记忆只是增益，查不到就空着
             return ""
         lines = []
         for r in rows:
             ts = time.strftime("%m-%d %H:%M", time.localtime(r["ts"] or 0))
-            what = (f"{r['inst_id']} {r['direction']}（均分{r['avg_score']}）"
-                    if r["inst_id"] else "")
-            lines.append(f"  {ts} 状态={r['status']} {what}")
+            what = (f"[{r['analyst']}] {r['inst_id']} {r['direction']}"
+                    f" 均分{fmt_score(r['avg_score'])}" if r["inst_id"] else "")
+            outcome = ""
+            if r["realized_pnl"] is not None:
+                rr = r["r_multiple"]
+                outcome = (f" → {r['exit_reason'] or 'closed'} "
+                           f"{rr:+.1f}R（{r['realized_pnl']:+.2f} U）")
+            elif r["status"] in ("opened", "no_fill", "planned"):
+                outcome = " → 持仓中"
+            lines.append(f"  {ts} 状态={r['status']} {what}{outcome}")
+        lines.append(self._analyst_track_record())
         return "\n".join(reversed(lines))
+
+    def _analyst_track_record(self):
+        """按人设的累计战绩（与 /api/stats 的 by_analyst 同一查询口径）。"""
+        if self.store is None:
+            return ""
+        try:
+            rows = self.store.query(
+                "SELECT analyst, COUNT(*) n, "
+                "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) wins, "
+                "SUM(r_multiple) sum_r FROM trades "
+                "WHERE status='closed' AND analyst IS NOT NULL GROUP BY analyst")
+        except Exception:  # noqa: BLE001
+            return ""
+        if not rows:
+            return ""
+        parts = [f"{r['analyst']} {r['n']}笔 胜率"
+                 f"{(r['wins'] / r['n']) * 100:.0f}% 累计{r['sum_r']:+.1f}R"
+                 for r in rows]
+        return "  按人设战绩：" + "｜".join(parts)
 
 
 
@@ -202,6 +366,8 @@ class Committee:
         if self.llm.available:
             user = (f"{factor_text}\n\n{account_ctx}\n\n"
                     f"注意：已有持仓的标的不允许再提（当前持仓：{held or '无'}）。"
+                    f"reason 必须以 'Delta: ' 开头——先说明相比上一轮你的判断"
+                    f"变了什么（或为何维持），再给证据与结论。"
                     f"请以你的人设给出本轮决策，只输出 JSON：\n"
                     f'开仓: {{"action":"open","instId":"...","direction":"long|short",'
                     f'"stop_loss":数字,"confidence":0~1,"reason":"..."}}\n'

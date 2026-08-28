@@ -15,16 +15,36 @@ SCHEMA_PATH = os.path.join(HERE, "schema.sql")
 
 
 def init_db(db_path):
-    """建库：执行 schema.sql + 设 WAL。幂等（全部 IF NOT EXISTS）。"""
+    """建库：执行 schema.sql + 设 WAL + 旧库补列（幂等）。"""
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
             conn.executescript(f.read())
+        _add_missing_columns(conn)
         conn.commit()
     finally:
         conn.close()
     return db_path
+
+
+# 旧库升级：表已存在但缺新列时逐个 ALTER（fresh 库走 schema.sql 已包含）
+_NEW_COLUMNS = {
+    "rounds": [("round_type", "TEXT"), ("intent", "TEXT"),
+               ("final_action", "TEXT"), ("regime", "TEXT"),
+               ("advisor_endorsed", "TEXT"), ("revisions", "INTEGER DEFAULT 0")],
+    "llm_calls": [("cost_usd", "REAL")],
+}
+
+
+def _add_missing_columns(conn):
+    for table, columns in _NEW_COLUMNS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue  # 表还不存在（不该发生，schema.sql 已建）
+        for col, col_type in columns:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
 
 class Store:
