@@ -156,7 +156,7 @@ class RoundWriter:
             "contracts, entry_ref, stop_loss, target, rr, target_source, "
             "notional_usdt, risk_usdt, risk_pct, atr, leverage_after, "
             "kelly_mult, edge_p, edge_b, kelly_n, kelly_note) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.pk, proposal_pk, int(bool(verdict.get("passed"))),
              (m.group(1) if m else ("OTHER" if failures else None)),
              failures[0] if failures else None,

@@ -197,18 +197,20 @@ class RiskManager:
             eff_dist = max(stop_dist, atr_dist)
             risk_budget = equity * self.cfg.MAX_RISK_PER_TRADE \
                 * (tier.get("risk_mult", 1.0) if tier else 1.0)
-            # ── Kelly 系数（影子模式默认）：按人设历史成交校准的缩放系数。
-            #    ENABLED=false 时只算只入库；true 时才乘进预算。
-            #    LLM 置信度永远不进这个公式——校准只用 trades 表的真实成交。
-            kelly = {"mult": 1.0, "n": 0, "note": "kelly 未启用"}
-            if getattr(self.cfg, "KELLY_ENABLED", False):
+            # ── Kelly 系数（影子模式）：mult 无条件计算 + 入库（校准曲线先积累）；
+            #    KELLY_ENABLED=true 时才乘进预算。LLM 置信度永远不进这个公式——
+            #    校准只用 trades 表的真实成交。
+            kstore = getattr(self.state, "store", None)
+            kelly = {"mult": 1.0, "n": 0, "p": None, "b": None,
+                     "note": "无持久层 → 中性 1.0"}
+            if kstore is not None:
                 from .kelly import mult_for
-                kelly = mult_for(self.state.store,
-                                 plan.get("analyst"), self.cfg)
-                if abs(kelly["mult"] - 1.0) > 1e-9:
-                    risk_budget *= kelly["mult"]
-                    v.warn(f"Kelly: {plan.get('analyst')} mult="
-                           f"{kelly['mult']}（n={kelly['n']}，{kelly['note']}）")
+                kelly = mult_for(kstore, plan.get("analyst"), self.cfg)
+            if getattr(self.cfg, "KELLY_ENABLED", False) \
+                    and abs(kelly["mult"] - 1.0) > 1e-9:
+                risk_budget *= kelly["mult"]
+                v.warn(f"Kelly: {plan.get('analyst')} mult="
+                       f"{kelly['mult']}（n={kelly['n']}，{kelly['note']}）")
             self.last_kelly = kelly
             # ── R8 同向风险聚合：BTC/ETH/SOL 相关性 ~0.8-0.9，同向持仓本质是
             #    一笔放大 beta 押注——同向已用风险从本笔预算中扣除，聚合超限直接拒绝

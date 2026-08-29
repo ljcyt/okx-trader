@@ -212,6 +212,10 @@ class Committee:
                 break
             revised["analyst"] = candidate["analyst"]
             revised["slot"] = candidate.get("slot")
+            # 修订提案继承原提案的 regime/style——否则 _aggregate 的 regime 门控
+            # 对修订稿失效，等于"被扣分的提案修订一轮就能免罚重打分"
+            revised["regime"] = candidate.get("regime")
+            revised["style"] = candidate.get("style")
             proposals = [revised]
             judging = self._ask_judges(proposals, factor_text, account_ctx,
                                        snapshot)
@@ -301,33 +305,21 @@ class Committee:
                 own=[p.get("stop_loss"), p.get("entry_hint"),
                      p.get("confidence")] + consts)
             if missing:
-                # 检出即扣分——不依赖 store 是否可用
-                avg = round(avg - penalty, 2)
+                # 只记录，不扣分不禁言：派生值（算出的 RR/百分比）会持续误报，
+                # 而 −2 分 + 禁言的代价被一次误报实测证伪过（趋势猎手冤案）
                 p["hallucinated"] = missing
             if self.store is not None:
-                # 误报的代价太大：禁言只在【连续 5 轮】幻觉时生效且【不持久】——
-                # 干净轮次 streak 衰减 1（而非清零），两轮干净即脱离降级
                 streak_key = f"hallu_streak_{p.get('analyst')}"
                 if missing:
                     streak = int(self.store.state_get(self.env, streak_key) or 0) + 1
                     self.store.state_set(self.env, streak_key, streak)
-                    if streak >= HALLUCINATION_DEMOTE_STREAK:
-                        p["demoted"] = True
-                        w.write_event(
-                            self.store, self.env, "hallucinated_number",
-                            f"{p.get('analyst')} 连续 {streak} 轮幻觉数字，"
-                            f"本轮降为 observing（连续两轮干净自动恢复）",
-                            level="warn")
-                else:
-                    streak = int(self.store.state_get(self.env, streak_key) or 0)
-                    if streak > 0:
-                        self.store.state_set(self.env, streak_key, max(0, streak - 1))
-                if missing:
                     w.write_event(
                         self.store, self.env, "hallucinated_number",
                         f"{p.get('analyst')} 提案引用了因子报告里不存在的数字："
-                        f"{missing}（连续第 {int(self.store.state_get(self.env, streak_key) or 0)} 次）",
+                        f"{missing}（连续第 {streak} 次）",
                         level="warn")
+                else:
+                    self.store.state_set(self.env, streak_key, 0)
 
             # regime 门控：趋势市压均值回归、震荡市压趋势、高波动统压——
             # 否则强趋势里"多头排列"和"RSI 超买"会同时成立，两个人设对同一
