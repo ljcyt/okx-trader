@@ -195,7 +195,7 @@ class Committee:
             revised = self._ask_revision(candidate, concerns, snapshot,
                                          factor_text, account_ctx, held)
             if not revised or revised.get("action") != "open":
-                proposals = []      # 撤回
+                # 撤回：保留原提案及其打分（审计回溯需要看到"提了什么、为何被拒"）
                 break
             revised["analyst"] = candidate["analyst"]
             revised["slot"] = candidate.get("slot")
