@@ -26,10 +26,16 @@ def fmt_score(v):
     return "—" if v is None else f"{float(v):.1f}"
 
 
-def verify_numbers(reason, report_text, own=(), tol=0.005):
+def verify_numbers(reason, report_text, own=()):
     """防幻觉闸门（代码做，不靠模型自觉）：
-    提案 reason 里引用的数字必须能在该标的因子报告原文里找到
-    （±0.5% 相对误差）；自己算出的字段（止损价/入场价/置信度）豁免。
+    提案 reason 里引用的数字必须能在该标的因子报告原文里找到。
+
+    容差按量级分档（相对误差）：
+        >=1000（价格类）0.05% —— 否则 BTC ±0.5% = ±400，闸门形同虚设
+        1~1000（RSI/比率）0.5%
+        <1（费率/小占比）5%
+    连字符数字区间先规约（"2515-2538" 是两个数字，不是 "-2538"）；
+    原始值与百分号写法（0.0001 vs 0.0100%）互相兼容。
     返回对不上号的数字列表。"""
     import re
 
@@ -39,8 +45,29 @@ def verify_numbers(reason, report_text, own=(), tol=0.005):
         except (ValueError, TypeError):
             return None
 
-    cited = re.findall(r"-?\d+\.?\d*%?", str(reason or ""))
-    pool = [_num(t) for t in re.findall(r"-?\d+\.?\d*%?", str(report_text or ""))]
+    def _tokens(text):
+        text = re.sub(r"(?<=\d)\s*[-\u2013]\s*(?=\d)", "，", str(text or ""))
+        return re.findall(r"-?\d+\.?\d*%?", text)
+
+    def _match(cv, pool):
+        for t in pool:
+            if abs(cv - t) <= _tol(cv) * max(abs(cv), abs(t), 1e-9):
+                return True
+            # 原始值 vs 百分号写法互认：0.0001 ↔ 0.0100%
+            if abs(cv * 100 - t) <= _tol(cv) * max(abs(cv * 100), abs(t), 1e-9):
+                return True
+        return False
+
+    def _tol(v):
+        a = abs(v)
+        if a >= 1000:
+            return 0.0005
+        if a >= 1:
+            return 0.005
+        return 0.05
+
+    cited = _tokens(reason)
+    pool = [_num(t) for t in _tokens(report_text)]
     pool = [p for p in pool if p is not None]
     own_vals = [_num(o) for o in own]
     own_vals = [o for o in own_vals if o is not None]
@@ -49,9 +76,9 @@ def verify_numbers(reason, report_text, own=(), tol=0.005):
         cv = _num(c)
         if cv is None:
             continue
-        if any(abs(cv - t) <= tol * max(abs(cv), abs(t), 1e-9) for t in pool):
+        if _match(cv, pool):
             continue
-        if any(abs(cv - o) <= tol * max(abs(cv), abs(o), 1e-9) for o in own_vals):
+        if _match(cv, own_vals):  # 自己算出来的字段豁免
             continue
         missing.append(c)
     return missing
@@ -245,22 +272,34 @@ class Committee:
                 factor_texts.get(p.get("instId"), ""),
                 own=[p.get("stop_loss"), p.get("entry_hint"),
                      p.get("confidence")])
-            if missing and self.store is not None:
+            if missing:
+                # 检出即扣分——不依赖 store 是否可用
                 avg = round(avg - penalty, 2)
                 p["hallucinated"] = missing
+            if self.store is not None:
                 streak_key = f"hallu_streak_{p.get('analyst')}"
-                streak = int(self.store.state_get(self.env, streak_key) or 0) + 1
-                self.store.state_set(self.env, streak_key, streak)
-                if streak >= HALLUCINATION_DEMOTE_STREAK:
+                flag_key = f"hallu_demoted_{p.get('analyst')}"
+                if missing:
+                    streak = int(self.store.state_get(self.env, streak_key) or 0) + 1
+                    self.store.state_set(self.env, streak_key, streak)
+                    if streak >= HALLUCINATION_DEMOTE_STREAK:
+                        # 降级是持久的：置位后不随干净轮次清零（恢复需人工删 key）
+                        self.store.state_set(self.env, flag_key, True)
+                        w.write_event(
+                            self.store, self.env, "hallucinated_number",
+                            f"{p.get('analyst')} 连续 {streak} 轮出现幻觉数字，"
+                            f"降为 observing（只记录意见，不参与授权）",
+                            level="warn")
+                else:
+                    self.store.state_set(self.env, streak_key, 0)
+                if bool(self.store.state_get(self.env, flag_key)):
                     p["demoted"] = True
-                w.write_event(
-                    self.store, self.env, "hallucinated_number",
-                    f"{p.get('analyst')} 提案引用了因子报告里不存在的数字："
-                    f"{missing}（连续第 {streak} 次）",
-                    level="warn")
-            elif self.store is not None:
-                self.store.state_set(
-                    self.env, f"hallu_streak_{p.get('analyst')}", 0)
+                if missing:
+                    w.write_event(
+                        self.store, self.env, "hallucinated_number",
+                        f"{p.get('analyst')} 提案引用了因子报告里不存在的数字："
+                        f"{missing}（连续第 {int(self.store.state_get(self.env, streak_key) or 0)} 次）",
+                        level="warn")
 
             p["avg_score"] = avg
             p["qualify"] = (len(scores) >= MIN_JUDGE_VOTES

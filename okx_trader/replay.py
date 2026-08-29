@@ -111,7 +111,7 @@ class ReplayClient:
     def get_taker_volume_ratio(self, ccy, period="1H"):
         return None
 
-    def get_candles(self, inst_id, bar="1H", limit=100):
+    def get_candles(self, inst_id, bar="1H", limit=100, after=None):
         candles = list(self.candles.get(inst_id) or [])
         # 追加当前轮的"最新已收盘"K线（随游标推进），保持价格路径与因子一致
         px = self._last_close()

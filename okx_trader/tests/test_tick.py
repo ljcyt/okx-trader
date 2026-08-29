@@ -93,21 +93,34 @@ class DrawdownLadderTest(unittest.TestCase):
                                   "write_order": lambda *a, **k: None})()
 
     def _set_dd(self, dd):
+        """直接以 (equity, hwm) 参数驱动阶梯（与 tick 的取数方式一致）。"""
         hwm = 10000.0
-        self.loop.last_snapshot = {"equity": hwm * (1 - dd), "hwm": hwm}
+        self.loop._evaluate_drawdown_ladder(self.rw, equity=hwm * (1 - dd),
+                                            hwm=hwm)
 
     def test_rung_upgrade_and_hysteresis_downgrade(self):
         self._set_dd(0.05)                      # ≥4% → 第 1 档
-        self.loop._evaluate_drawdown_ladder(self.rw)
         self.assertEqual(self.loop.risk.state.get_rung(), 1)
         self._set_dd(0.039)                     # <3.2%？否 → 不降档（滞回）
-        self.loop._evaluate_drawdown_ladder(self.rw)
         self.assertEqual(self.loop.risk.state.get_rung(), 1)
         self._set_dd(0.031)                     # <3.2% → 降档
-        self.loop._evaluate_drawdown_ladder(self.rw)
         self.assertEqual(self.loop.risk.state.get_rung(), 0)
         events = self.store_events()
         self.assertEqual(events.count("circuit_breaker"), 2)  # 升档 + 降档
+
+    def test_tick_uses_fresh_equity_not_stale_snapshot(self):
+        """高2 回归：risk_tick 必须用本 tick 新采样的权益评估阶梯，
+        即使 last_snapshot 是 None（首次 round 之前）也能触发。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8c-"))
+        self.assertIsNone(loop.last_snapshot)   # 尚未跑过任何 round
+        loop.risk.state.update_hwm(10000.0)     # 高水位来自此前的高点
+        loop.client.equity = 9500.0             # 权益跌到 9500 → 回撤 5%
+        loop.risk_tick()
+        self.assertEqual(loop.risk.state.get_rung(), 1)
+        # 权益采样也写进了 equity_curve
+        n = loop.store.query_one(
+            "SELECT COUNT(*) c FROM equity_curve WHERE round_pk IS NULL")["c"]
+        self.assertEqual(n, 1)
 
     def store_events(self):
         return [r["kind"] for r in self.loop.store.query(
@@ -122,7 +135,6 @@ class DrawdownLadderTest(unittest.TestCase):
         self.loop.risk.state.set_positions_meta({"BTC-USDT-SWAP": {
             "direction": "long", "stop": 77000.0, "contracts": 5.0}})
         self._set_dd(0.11)                      # ≥10% → 末档
-        self.loop._evaluate_drawdown_ladder(self.rw)
         self.assertEqual(self.loop.risk.state.get_rung(), 3)
         self.assertTrue(self.loop.paused)                      # 停机待人工
         self.assertEqual(len(self.loop.client.positions), 0)   # 全平

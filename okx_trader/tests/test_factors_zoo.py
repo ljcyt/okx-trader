@@ -25,17 +25,30 @@ from okx_trader.store.factors_zoo import (backfill_returns, collect_from_report,
 
 
 class ReplayStubClient:
-    """只提供 get_candles 的最小 stub：确定性 close 序列。"""
+    """只提供 get_candles 的最小 stub：确定性 close 序列。
+    遵守 OKX 的单页 limit≤300 约束并支持 after 游标翻页（分页测试用）。"""
 
-    def __init__(self, closes, bar_ms=3600 * 1000, t0=None):
+    def __init__(self, closes, bar_ms=3600 * 1000, t0=None, max_page=300):
         self.closes = closes
         self.bar_ms = bar_ms
         self.t0 = t0 or int(time.time() * 1000) - len(closes) * bar_ms
+        self.max_page = max_page
+        self.page_calls = 0
+        self.last_limit = None
 
-    def get_candles(self, inst_id, bar="1H", limit=1000):
-        return [{"ts": self.t0 + i * self.bar_ms, "open": c, "high": c,
-                 "low": c, "close": c, "vol": 1.0}
-                for i, c in enumerate(self.closes)]
+    def get_candles(self, inst_id, bar="1H", limit=1000, after=None):
+        """模拟 OKX 分页：after=None 返回最新一页；after=ts 返回该 ts 之前
+        （更旧）的一页；每页都按时间升序返回（与 OKXClient 接口一致）。"""
+        self.page_calls += 1
+        self.last_limit = limit
+        seq = [{"ts": self.t0 + i * self.bar_ms, "open": c, "high": c,
+                "low": c, "close": c, "vol": 1.0}
+               for i, c in enumerate(self.closes)]
+        lim = max(1, min(limit, self.max_page))
+        if after is None:
+            return seq[-lim:]
+        older = [c for c in seq if c["ts"] < after]
+        return older[-lim:]
 
 
 def make_store():
@@ -132,18 +145,17 @@ class FactorZooTest(unittest.TestCase):
         self.assertEqual(defs["status"], "observing")
 
     def test_hard_regression_ic_identity(self):
-        """关键回归：value = fwd_ret_1b → ic ≈ 1.0；反号 → -1.0。
-        这条测试是前向收益对齐没写错的唯一证明。"""
+        """关键回归（名副其实的版本）：先走真实 backfill_returns，
+        再把 value 赋成回填出来的 fwd_ret_1b → ic ≈ 1.0；反号 → -1.0。
+        如果前向收益对齐写错（未来函数/错位），这条测试的 ic 就不是 ±1。"""
         gate = {"scored_days": 0, "days_tracked": 0,
                 "require_positive_rank_ic": True, "min_obs": 10}
         for sign, expected_ic in ((1.0, 1.0), (-1.0, -1.0)):
             store = make_store()
             client = ReplayStubClient(self.CLOSES)
-            # 造观测：value = 该 bar 的真实 1b 前向收益 × sign
-            closes = client.closes
-            for i in range(len(closes) - 2):
+            # 1) 造观测：value 先放占位数，fwd 全部留空
+            for i in range(len(client.closes) - 2):
                 bar_ts = client.t0 + i * client.bar_ms
-                fwd = closes[i + 1] / closes[i] - 1
                 store.execute(
                     "INSERT OR IGNORE INTO factor_defs(name, family, tier, "
                     "status, source, created_ts, status_ts) VALUES "
@@ -151,15 +163,102 @@ class FactorZooTest(unittest.TestCase):
                     (time.time(), time.time()))
                 store.execute(
                     "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, "
-                    "value, fwd_ret_1b, fwd_ret_4b, fwd_ret_24b, filled_ts) "
-                    "VALUES ('fake','BTC-USDT-SWAP',?,?,?,?,?,?)",
-                    (bar_ts, sign * fwd, fwd, 0.0, 0.0, time.time()))
+                    "value) VALUES ('fake','BTC-USDT-SWAP',?,?)",
+                    (bar_ts, 0.0))
+            # 2) 走真实的回填路径
+            backfill_returns(store, client)
+            # 3) value := 回填出来的 fwd_ret_1b（× sign）
+            store.execute("UPDATE factor_obs SET value = fwd_ret_1b * ?", (sign,))
             rows = score_factors(store, gate)
             r = next(r for r in rows if r["factor"] == "fake"
                      and r["horizon"] == "1b")
             self.assertIsNotNone(r["ic"])
             self.assertAlmostEqual(r["ic"], expected_ic, places=1,
-                                   msg="前向对齐几乎肯定写错了" if r["ic"] != expected_ic else "")
+                                   msg="前向对齐几乎肯定写错了")
+
+    def test_backfill_paginates_beyond_single_page(self):
+        """高1 回归：OKX 单页上限 300，远早于单页窗口的观测必须靠 after
+        翻页覆盖；且任何一页的 limit 不得超过 300。"""
+        store = make_store()
+        n = 900  # 需要 900 根 > 单页 300
+        closes = [100 + i * 0.1 for i in range(n)]
+        client = ReplayStubClient(closes, max_page=300)
+        for i in range(0, n - 30, 60):  # 覆盖远至 840 根前的 bar
+            bar_ts = client.t0 + i * client.bar_ms
+            store.execute(
+                "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
+                "source, created_ts, status_ts) VALUES "
+                "('fake','momentum','derived','observing','builtin',?,?)",
+                (time.time(), time.time()))
+            store.execute(
+                "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, value) "
+                "VALUES ('fake','BTC-USDT-SWAP',?,?)", (bar_ts, float(i)))
+        filled = backfill_returns(store, client)
+        self.assertGreater(client.page_calls, 1)   # 确实翻了页
+        self.assertLessEqual(client.last_limit, 300)  # 没有超交易所上限
+        pending = store.query_one(
+            "SELECT COUNT(*) c FROM factor_obs WHERE filled_ts IS NULL")["c"]
+        self.assertEqual(pending, 0)               # 全部回填完成
+        self.assertGreater(filled, 0)
+
+    def test_scored_days_counts_bar_dates_not_backfill_dates(self):
+        """中：scored_days 必须数观测 bar_ts 的自然日——补跑/重放把整批
+        观测盖上同一个 filled_ts 也不影响计分日。"""
+        store = make_store()
+        client = ReplayStubClient(self.CLOSES)
+        # 两个 bar 日期相隔 2 天，但会同时被同一次回填盖上
+        for i in (0, 48):
+            bar_ts = client.t0 + i * client.bar_ms
+            store.execute(
+                "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
+                "source, created_ts, status_ts) VALUES "
+                "('fake','momentum','derived','observing','builtin',?,?)",
+                (time.time(), time.time()))
+            store.execute(
+                "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, value) "
+                "VALUES ('fake','BTC-USDT-SWAP',?,?)", (bar_ts, float(i)))
+        backfill_returns(store, client)
+        rows = score_factors(store, {"scored_days": 0, "days_tracked": 0,
+                                     "min_obs": 1})
+        r = next(r for r in rows if r["factor"] == "fake"
+                 and r["horizon"] == "1b")
+        self.assertEqual(r["scored_days"], 2)
+
+    def test_prev_batch_required_for_activation(self):
+        """中：晋级 active 需要【上一批】（不含本批）也全过——同一批的三个
+        horizon 共享 computed_ts，不能自己证明自己。"""
+        gate = {"scored_days": 0, "days_tracked": 0, "min_obs": 10,
+                "require_positive_rank_ic": True}
+        store = make_store()
+        client = ReplayStubClient(self.CLOSES)
+        self._collect_into(store, client, lambda i: -float(i), n=30)  # 逆序 → 正 rank_ic
+        backfill_returns(store, client)
+        # 第一批：observing → trial
+        score_factors(store, gate)
+        self.assertEqual(store.query_one(
+            "SELECT status FROM factor_defs WHERE name='fake'")["status"], "trial")
+        # 新增观测（新批次）再打分：上一批过闸 → active
+        for i in range(30, 40):
+            bar_ts = client.t0 + i * client.bar_ms
+            store.execute(
+                "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, value) "
+                "VALUES ('fake','BTC-USDT-SWAP',?,?)", (bar_ts, -float(i)))
+        backfill_returns(store, client)
+        score_factors(store, gate)  # 第二批：上一批全过 → active
+        self.assertEqual(store.query_one(
+            "SELECT status FROM factor_defs WHERE name='fake'")["status"], "active")
+
+    def _collect_into(self, store, client, value_fn, n):
+        for i in range(n):
+            bar_ts = client.t0 + i * client.bar_ms
+            store.execute(
+                "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
+                "source, created_ts, status_ts) VALUES "
+                "('fake','momentum','derived','observing','builtin',?,?)",
+                (time.time(), time.time()))
+            store.execute(
+                "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, value) "
+                "VALUES ('fake','BTC-USDT-SWAP',?,?)", (bar_ts, value_fn(i)))
 
     def test_gate_blocks_small_samples(self):
         """样本不足 → 只记录不判定（gate_passed=0，不晋级）。"""

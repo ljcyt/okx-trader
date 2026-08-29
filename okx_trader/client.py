@@ -311,12 +311,17 @@ class OKXClient:
             "next_time": int(d.get("fundingTime") or 0),
         }
 
-    def get_candles(self, inst_id, bar="1H", limit=100):
+    def get_candles(self, inst_id, bar="1H", limit=100, after=None):
         """K 线（时间升序返回，不含未收盘的当前 K 线），用于计算 ATR/波动率/因子。
         bar 可选：1m/5m/15m/1H/4H/1D 等。
+        after：OKX 分页游标（返回该时间戳**之前/更旧**的记录）——回填老观测用。
+        注意：/market/candles 的 limit 上限是 300，调用方超限会被交易所拒绝。
         """
+        kw = dict(bar=bar, limit=str(int(min(limit, 300))))
+        if after:
+            kw["after"] = str(int(after))
         resp = self._call("get_candles", self.market.get_candlesticks,
-                          inst_id, bar=bar, limit=str(limit))
+                          inst_id, **kw)
         rows = list(reversed(resp.get("data", [])))  # OKX 倒序 → 升序
         rows, dropped = self._clean_candle_rows(rows, bar)
         if dropped:

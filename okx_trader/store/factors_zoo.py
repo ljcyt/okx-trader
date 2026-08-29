@@ -46,35 +46,43 @@ FACTOR_EXTRACTORS = {
 }
 
 HORIZONS = ("1b", "4b", "24b")
-_BAR_SEC = {"m": 60, "H": 3600, "D": 86400}
+_BAR_SEC = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "M": 2592000}
+_CANDLE_PAGE = 300          # OKX /market/candles 单页上限
+_MAX_PAGES = 6              # 最多翻 6 页（1H×1800 根 ≈ 75 天，远超 24b 需求）
 
 
 def _bar_ms(bar):
+    """周期串 → 毫秒。不认识的周期直接抛错——静默兜底 1H 会造出错误的前向收益。"""
     import re
-    m = re.match(r"^(\d+)([mHdD])$", str(bar))
-    return int(m.group(1)) * _BAR_SEC[m.group(2)] * 1000 if m else 3600 * 1000
+    m = re.match(r"^(\d+)([mHhdDwM])$", str(bar))
+    if not m:
+        raise ValueError(f"未知 K 线周期：{bar!r}")
+    unit = {"H": "h", "D": "d"}.get(m.group(2), m.group(2))
+    return int(m.group(1)) * _BAR_SEC[unit] * 1000
 
 
 # ── 采集（每轮）────────────────────────────────────────────────
 
 def collect_from_report(store, round_pk, inst_id, report, bar):
-    """把一轮的因子值摊平成 factor_obs 行。主键幂等：重放不产生重复。"""
+    """把一轮的因子值摊平成 factor_obs 行。主键幂等：重放不产生重复。
+    factor_defs 一次性批量注册（不再每因子一条）。"""
     now = time.time()
     bar_ts = report.get("ts")
     if not bar_ts:
         return 0
+    for name, (family, tier, _) in FACTOR_EXTRACTORS.items():
+        store.execute(
+            "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
+            "source, created_ts, status_ts) VALUES (?,?,?,?, 'builtin', ?, ?)",
+            (name, family, tier, "observing", now, now))
     n = 0
-    for name, (family, tier, extractor) in FACTOR_EXTRACTORS.items():
+    for name, (_, _, extractor) in FACTOR_EXTRACTORS.items():
         try:
             value = extractor(report)
         except Exception:  # noqa: BLE001
             value = None
         if value is None or not math.isfinite(value):
             continue
-        store.execute(
-            "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
-            "source, created_ts, status_ts) VALUES (?,?,?,?, 'builtin', ?, ?)",
-            (name, family, tier, "observing", now, now))
         store.execute(
             "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, round_pk, "
             "value) VALUES (?,?,?,?,?)",
@@ -88,7 +96,13 @@ def collect_from_report(store, round_pk, inst_id, report, bar):
 def backfill_returns(store, client, bar="1H", horizons=("1b", "4b", "24b"),
                      max_rows=50000):
     """对 filled_ts IS NULL 的观测回填前向收益。按 bar_ts 对齐到已收盘 K 线。
-    filled_ts 只在全部 horizon 都填完后才置位（否则 4b/24b 会永远漏填）。"""
+    filled_ts 只在全部 horizon 都填完后才置位（否则 4b/24b 会永远漏填）。
+
+    K 线拉取：单页上限 300（OKX /market/candles 限制），用 after 游标向更旧
+    翻页，直到覆盖最早的待回填观测 + 24 根；翻页耗尽仍未覆盖的观测保持
+    pending，下次再试。任何异常必须记 warning——静默跳过会让观测永远填不上、
+    IC 永远是空而无人知晓。
+    """
     bar_ms = _bar_ms(bar)
     pending_insts = store.query(
         "SELECT DISTINCT inst_id FROM factor_obs WHERE filled_ts IS NULL")
@@ -96,16 +110,22 @@ def backfill_returns(store, client, bar="1H", horizons=("1b", "4b", "24b"),
     for row in pending_insts:
         inst = row["inst_id"]
         try:
-            candles = client.get_candles(inst, bar=bar, limit=1000)
-        except Exception:  # noqa: BLE001 —— 行情不可用就等下一轮
+            closes, oldest_ts = _fetch_closes_paged(client, inst, bar)
+        except Exception as e:  # noqa: BLE001 —— 失败必须可见，不能静默空转
+            client.log.warning(
+                "backfill_returns：%s K 线拉取失败（%s: %s）——本标的观测保持 pending",
+                inst, type(e).__name__, e)
             continue
-        closes = {c["ts"]: c["close"] for c in candles}
         obs = store.query(
             "SELECT rowid, bar_ts, fwd_ret_1b, fwd_ret_4b, fwd_ret_24b "
             "FROM factor_obs WHERE inst_id=? AND filled_ts IS NULL", (inst,))
         for o in obs:
             base = closes.get(o["bar_ts"])
             if not base:
+                if o["bar_ts"] < oldest_ts:
+                    client.log.warning(
+                        "backfill_returns：%s bar_ts=%s 早于可回看范围（翻页耗尽），"
+                        "放弃该观测", inst, o["bar_ts"])
                 continue
             for hz in horizons:
                 if o[f"fwd_ret_{hz}"] is not None:
@@ -126,6 +146,27 @@ def backfill_returns(store, client, bar="1H", horizons=("1b", "4b", "24b"),
             if total >= max_rows:
                 return total
     return total
+
+
+def _fetch_closes_paged(client, inst, bar):
+    """拉 close 序列，覆盖最近 _CANDLE_PAGE 根 + 向更旧翻页直到连续两页空。
+    返回 ({ts: close}, oldest_ts)。"""
+    closes = {}
+    after = None
+    oldest = None
+    for _ in range(_MAX_PAGES):
+        candles = client.get_candles(inst, bar=bar, limit=_CANDLE_PAGE,
+                                     after=after)
+        if not candles:
+            break
+        for c in candles:
+            closes[c["ts"]] = c["close"]
+        page_oldest = min(c["ts"] for c in candles)
+        if oldest is not None and page_oldest >= oldest:
+            break  # 游标不再前进（到头了）
+        oldest = page_oldest
+        after = oldest  # after=返回比该 ts 更旧的记录
+    return closes, (oldest or 0)
 
 
 # ── 打分与晋级（okxt score-factors，可挂每周定时）────────────────
@@ -160,8 +201,15 @@ def _spearman(xs, ys):
     return _pearson(ranks(xs), ranks(ys))
 
 
-def score_factors(store, gate, bar="1H", days_tracked_from_db=True):
-    """逐 (factor, horizon) 打分并走晋级状态机。返回打分快照列表。"""
+def score_factors(store, gate, bar="1H", env="paper"):
+    """逐 (factor, horizon) 打分并走晋级状态机。返回打分快照列表。
+
+    口径说明：
+    - scored_days 数的是观测 bar_ts 的自然日（计分日），不是回填执行日——
+      补跑/重放不会把一批观测盖上同一个日期而推迟晋级。
+    - IC 跨标的混算，但 value 先按标的 z-score：否则 atr_pct 这类量级差异
+      会直接进 Pearson，数出来的东西量纲可疑。
+    """
     now = time.time()
     out = []
     defs = store.query("SELECT name, family, tier, status, created_ts "
@@ -169,25 +217,29 @@ def score_factors(store, gate, bar="1H", days_tracked_from_db=True):
     for d in defs:
         for hz in HORIZONS:
             obs = store.query(
-                f"SELECT value, fwd_ret_{hz} v, filled_ts FROM factor_obs "
+                f"SELECT inst_id, value, fwd_ret_{hz} v, bar_ts FROM factor_obs "
                 f"WHERE factor=? AND fwd_ret_{hz} IS NOT NULL", (d["name"],))
-            pairs = [(o["value"], o["v"], o["filled_ts"]) for o in obs]
-            n = len(pairs)
-            scored_days = len({time.strftime("%Y-%m-%d", time.localtime(f))
-                               for _, _, f in pairs if f}) if n else 0
+            n = len(obs)
+            scored_days = len({time.strftime("%Y-%m-%d",
+                                             time.localtime(o["bar_ts"] / 1000))
+                               for o in obs}) if n else 0
             tracked_days = int((now - d["created_ts"]) / 86400) + 1
 
             ic = rank_ic = ic_t = hit = None
             if n >= 3:
-                xs = [p[0] for p in pairs]
-                ys = [p[1] for p in pairs]
+                xs = _zscore_by_inst(obs)
+                ys = [o["v"] for o in obs]
                 ic = _pearson(xs, ys)
                 rank_ic = _spearman(xs, ys)
                 if ic is not None and abs(ic) < 1:
                     ic_t = ic * math.sqrt(n - 2) / math.sqrt(1 - ic * ic)
                 elif ic is not None:
                     ic_t = math.copysign(math.inf, ic)
-                hit = (sum(1 for p in pairs if p[0] * p[1] > 0) / n) if n else None
+                # 命中率只在因子取值有正有负时有意义——恒正因子（rsi14、
+                # atr_pct、量比…）会退化成"市场上涨比例"，量的是行情不是因子
+                vals = [o["value"] for o in obs]
+                if any(v > 0 for v in vals) and any(v < 0 for v in vals):
+                    hit = sum(1 for o in obs if o["value"] * o["v"] > 0) / n
 
             gate_passed = 0
             if n >= gate.get("min_obs", 100):
@@ -209,16 +261,33 @@ def score_factors(store, gate, bar="1H", days_tracked_from_db=True):
                         "gate_passed": gate_passed})
 
         # 状态机（任意 horizon 过闸即可晋级；全部用最新数据重判）
-        _transition(store, d, out, gate)
+        _transition(store, d, out, gate, env=env, batch_ts=now)
     return out
 
 
-def _transition(store, d, scored_rows, gate):
+def _zscore_by_inst(obs):
+    """value 按标的 z-score 后摊平（跨标的混算前去量纲）。std=0 的标的全 0。"""
+    by_inst = {}
+    for o in obs:
+        by_inst.setdefault(o["inst_id"], []).append(o["value"])
+    stats = {}
+    for inst, vals in by_inst.items():
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / len(vals)
+        stats[inst] = (mean, math.sqrt(var))
+    out = []
+    for o in obs:
+        mean, std = stats[o["inst_id"]]
+        out.append((o["value"] - mean) / std if std > 0 else 0.0)
+    return out
+
+
+def _transition(store, d, scored_rows, gate, env="paper", batch_ts=None):
     """candidate → observing → trial → active；反转 → retired；长期不达标 → rejected。
 
     规则（数据不足只记录不判定）：
       trial   = 任一 horizon gate_passed 且 days_tracked ≥ gate.days_tracked
-      active  = trial 保持 gate_passed 连续两批（用最近两批 score 判定）
+      active  = trial 且【上一批】（不含本批）也全部过闸 —— 连续两批
       retired = 已 active 但最新批次 rank_ic ≤ 0
       rejected = tracked ≥ 2×days_tracked 且从未 trial
     """
@@ -228,6 +297,9 @@ def _transition(store, d, scored_rows, gate):
     if not best:
         return
 
+    rank_txt = (f"{best['rank_ic']:.3f}" if best["rank_ic"] is not None
+                else "n/a")
+
     def _set(new_status, note):
         store.execute("UPDATE factor_defs SET status=?, status_ts=?, "
                       "status_note=? WHERE name=?", (new_status, time.time(),
@@ -235,29 +307,33 @@ def _transition(store, d, scored_rows, gate):
         store.execute(
             "INSERT INTO app_events(ts, env, level, kind, message, detail_json) "
             "VALUES (?,?,?,?,?,?)",
-            (time.time(), "paper", "info", "factor_status",
+            (time.time(), env, "info", "factor_status",
              f"因子 {name}: {status} → {new_status}（{note}）", None))
 
     tracked = best["days_tracked"]
     if status == "observing" and best["gate_passed"] and \
             tracked >= gate.get("days_tracked", 30):
-        _set("trial", f"过闸：rank_ic={best['rank_ic']:.3f}")
+        _set("trial", f"过闸：rank_ic={rank_txt}")
     elif status == "trial":
         if not best["gate_passed"] or (best["rank_ic"] is not None
                                        and best["rank_ic"] <= 0):
             _set("retired", f"闸门反转：rank_ic={best['rank_ic']}")
-        elif _prev_batch_also_passed(store, name):
-            _set("active", f"连续两批过闸：rank_ic={best['rank_ic']:.3f}")
+        elif _prev_batch_also_passed(store, name, batch_ts):
+            _set("active", f"连续两批过闸：rank_ic={rank_txt}")
     elif status == "active" and best["rank_ic"] is not None and best["rank_ic"] <= 0:
         _set("retired", f"闸门反转：rank_ic={best['rank_ic']:.3f}")
     elif status == "observing" and tracked >= 2 * gate.get("days_tracked", 30):
         _set("rejected", "长期未过闸")
 
 
-def _prev_batch_also_passed(store, name):
+def _prev_batch_also_passed(store, name, batch_ts=None):
+    """看【上一批】（computed_ts 严格早于本批）的 3 个 horizon 是否全过。
+    同一次 score_factors 里三个 horizon 共享 computed_ts，必须排除本批。"""
+    now = batch_ts if batch_ts is not None else time.time()
     rows = store.query(
         "SELECT gate_passed FROM factor_scores WHERE factor=? "
-        "ORDER BY computed_ts DESC LIMIT 4", (name,))  # 最近 3 个 horizon + 本批
+        "AND computed_ts < ? ORDER BY computed_ts DESC LIMIT 3",
+        (name, now))
     if len(rows) < 3:
         return False
-    return all(r["gate_passed"] for r in rows[:3])
+    return all(r["gate_passed"] for r in rows)

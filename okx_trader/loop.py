@@ -666,9 +666,17 @@ class TradingLoop:
 
     def risk_tick(self):
         """5 分钟机械风控 tick（不花 LLM）：巡检保护单、移动/时间止损、
-        回撤阶梯、权益采样。只做 3 类只读调用 + 必要时的撤挂单。"""
+        回撤阶梯、权益采样。只做 3 类只读调用 + 必要时的撤挂单。
+        权益必须先采样——阶梯判断用新鲜数字，不能用最多 1 小时前的快照。"""
         if self.paused:
             return
+        try:  # 先采样权益并抬升高水位（阶梯与曲线都用这份新鲜值）
+            eq = self.client.get_equity()
+            hwm, dd = self.risk.state.update_hwm(eq["total_eq"])
+            equity = eq["total_eq"]
+        except Exception:  # noqa: BLE001
+            equity = hwm = dd = None
+            self.log.warning("tick 权益采样失败，本轮阶梯跳过", exc_info=True)
         positions = self.client.get_positions()
         tick_rw = _TickWriter(self.store)
         # ATR 用最近一轮的因子值（避免每 tick 重复拉 K 线）
@@ -682,24 +690,19 @@ class TradingLoop:
         snap = {"positions": positions, "factors": factors}
         self._patrol_positions(snap, tick_rw)
         manage_open_positions(self, snap, tick_rw)
-        self._evaluate_drawdown_ladder(tick_rw)
-        try:  # 权益采样（round_pk NULL → 面板分钟级曲线）
-            eq = self.client.get_equity()
-            hwm, dd = self.risk.state.update_hwm(eq["total_eq"])
+        if equity:
+            self._evaluate_drawdown_ladder(tick_rw, equity=equity, hwm=hwm)
             w.write_equity(self.store, self.env.name, time.time(),
-                           eq["total_eq"], hwm, dd, eq["usdt_avail"], None,
+                           equity, hwm, dd, eq["usdt_avail"], None,
                            len(positions))
-        except Exception:  # noqa: BLE001
-            self.log.debug("tick 权益采样失败", exc_info=True)
         ticks = int(self.store.state_get(self.env.name, "risk_ticks") or 0) + 1
         self.store.state_set(self.env.name, "risk_ticks", ticks)
         self.store.state_set(self.env.name, "last_risk_tick_ts", time.time())
 
-    def _evaluate_drawdown_ladder(self, rw):
-        """回撤阶梯（升档立即生效；降档需回撤 < 当前档阈值 80%，防抖动）。"""
+    def _evaluate_drawdown_ladder(self, rw, equity, hwm):
+        """回撤阶梯（升档立即生效；降档需回撤 < 当前档阈值 80%，防抖动）。
+        equity/hwm 由调用方传入（tick 每次新采样，round 用当轮快照）。"""
         ladder = list(getattr(self.cfg, "DRAWDOWN_LADDER", []) or [])
-        equity = (self.last_snapshot or {}).get("equity")
-        hwm = (self.last_snapshot or {}).get("hwm")
         if not ladder or not equity or not hwm:
             return
         drawdown = (hwm - equity) / hwm
