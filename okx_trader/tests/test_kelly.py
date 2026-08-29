@@ -18,7 +18,7 @@ from okx_trader.kelly import estimate
 
 
 def make_cfg(**kw):
-    base = {"KELLY_MIN_SAMPLES": 30, "KELLY_FRACTION": 0.5,
+    base = {"KELLY_MIN_SAMPLES": 30,
             "KELLY_MIN_MULT": 0.25, "KELLY_SIG_LEVEL": 0.05}
     base.update(kw)
     return type("C", (), base)()

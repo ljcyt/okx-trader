@@ -35,7 +35,7 @@ def make_report():
 
 def make_committee(store=None):
     cfg = type("C", (), {"SYMBOLS": ["BTC-USDT-SWAP"], "SCORE_THRESHOLD": 6.5,
-                         "HALLUCINATION_PENALTY": 2.0, "MAX_REVISIONS": 1,
+                         "MAX_REVISIONS": 1,
                          "ATR_BAR": "1H"})()
     cm = Committee.__new__(Committee)
     cm.cfg, cm.threshold = cfg, 6.5

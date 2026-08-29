@@ -34,6 +34,7 @@ _NEW_COLUMNS = {
                ("final_action", "TEXT"), ("regime", "TEXT"),
                ("advisor_endorsed", "TEXT"), ("revisions", "INTEGER DEFAULT 0")],
     "llm_calls": [("cost_usd", "REAL")],
+    "proposals": [("regime_penalty", "INTEGER DEFAULT 0"), ("regime_note", "TEXT")],
     "risk_verdicts": [("kelly_mult", "REAL"), ("edge_p", "REAL"),
                       ("edge_b", "REAL"), ("kelly_n", "INTEGER"),
                       ("kelly_note", "TEXT")],

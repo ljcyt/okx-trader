@@ -45,10 +45,9 @@ REGIME_MISMATCH_PENALTY = 1.0  # 人设×市况错配扣分（趋势市压均值
 
 # ── Kelly 仓位系数（默认影子模式：只算不改仓位）─────────────────────────────
 KELLY_ENABLED = False          # true 后 kelly_mult 才作用于 R3 预算
-KELLY_FRACTION = 0.5           # 分数 Kelly（半 Kelly）
 KELLY_MIN_MULT = 0.25          # 系数地板
 KELLY_MIN_SAMPLES = 30         # 每人设最少已平仓样本（不足 → 中性 1.0）
-KELLY_SIG_LEVEL = 0.05         # 二项检验显著性水平  # 人设×市况错配扣分（趋势市压均值回归等）  # 同方向持仓聚合风险上限（BTC/ETH/SOL 高相关，同向=放大beta）
+KELLY_SIG_LEVEL = 0.05         # t 检验显著性水平
 
 # 订单参数
 MAKER_PRICE_OFFSET = 0.0     # 0 = 平齐买一/卖一挂单（post_only 保证 maker）；0.0005 = 前方 0.05%

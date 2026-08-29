@@ -100,12 +100,14 @@ class RoundWriter:
         for slot, a in enumerate(analysts):
             pk = self.store.execute(
                 "INSERT INTO proposals(round_pk, slot, analyst, style, action, "
-                "inst_id, direction, stop_loss, entry_hint, confidence, reason) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "inst_id, direction, stop_loss, entry_hint, confidence, reason, "
+                "regime_penalty, regime_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (self.pk, slot, a.get("analyst"), a.get("style"),
                  a.get("action"), a.get("instId"), a.get("direction"),
                  a.get("stop_loss"), a.get("entry_hint"),
-                 a.get("confidence"), a.get("reason")))
+                 a.get("confidence"), a.get("reason"),
+                 1 if a.get("regime_penalty") else 0,
+                 a.get("regime_note")))
             slot_pks[slot] = pk
 
         # 过滤后下标 → slot：judging[].idx 是对 action=='open' 的提案列表的序号

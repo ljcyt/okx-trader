@@ -273,14 +273,18 @@ class Committee:
         return "llm" if self.llm.available else "baseline"
 
     def _aggregate(self, proposals, judging, snapshot):
-        """聚合：均分门槛 + 多数决 + 法定票数 + 数字核对扣分。
+        """聚合：均分门槛 + 多数决 + 法定票数 + 数字核对（只记录）。
 
         数字核对用代码做（不靠模型自觉）：提案 reason 里引用的数字必须能在
-        该标的的因子报告原文里找到（±0.5% 相对误差；自己算出的止损/入场价豁免）。
-        对不上的写 hallucinated_number 事件并扣分；同一人设连续多次出现幻觉
-        自动降为 observing——只记录意见，不再参与授权。
+        该标的的因子报告原文里找到（±0.5% 相对误差；自己算出的止损/入场价豁免，
+        方法论常量在白名单里）。对不上的写 hallucinated_number 事件并把缺失
+        数字记入 p["hallucinated"]——不扣分、不禁言：派生值（算出的 RR/百分比）
+        会持续误报，而扣分+禁言的代价被一次误报实测证伪过（趋势猎手冤案）。
+
+        regime 门控同样只改分数与结构化字段（p["regime_penalty"]/
+        p["regime_note"]），不动 p["reason"]——proposals.reason 入库的是
+        LLM 原话，系统注解走自己的列。
         """
-        penalty = float(getattr(self.cfg, "HALLUCINATION_PENALTY", 2.0) or 0)
         # 池子用【全部标的】的报告原文——LLM 收到的提示词含三份报告，
         # 跨标的引用（如引用 ETH 的 FVG 来论证 SOL）是合法论证
         all_reports_text = " NEWLINE_JOIN ".join(
@@ -322,28 +326,29 @@ class Committee:
                     self.store.state_set(self.env, streak_key, 0)
 
             # regime 门控（方向性）：趋势市压均值回归、震荡市压趋势、趋势方向
-            # 与提案方向相悖也压——否则强趋势里两个相反人设对同一标的各提一案
+            # 与提案方向相悖也压——否则强趋势里两个相反人设对同一标的各提一案。
+            # reg 是单一标签，high_vol 与 trending_*/ranging 互斥，不存在并罚
             style = p.get("style")
             reg = p.get("regime")
             rp = float(getattr(self.cfg, "REGIME_MISMATCH_PENALTY", 1.0) or 0)
-            mismatch = None
+            mismatch = None      # (说明文字, 扣分量)
             if reg in ("trending_up", "trending_down"):
                 if style == "meanrev":
-                    mismatch = f"{reg} 市压均值回归 −{rp}"
+                    mismatch = (f"{reg} 市压均值回归", rp)
                 elif style == "trend":
                     if reg == "trending_up" and p.get("direction") == "short":
-                        mismatch = f"trending_up 市压趋势做空 −{rp}"
+                        mismatch = ("trending_up 市压趋势做空", rp)
                     elif reg == "trending_down" and p.get("direction") == "long":
-                        mismatch = f"trending_down 市压趋势做多 −{rp}"
+                        mismatch = ("trending_down 市压趋势做多", rp)
             elif reg == "ranging" and style == "trend":
-                mismatch = f"ranging 市压趋势跟随 −{rp}"
-            if reg == "high_vol":
-                extra = f"高波动统压 −{rp * 0.5}"
-                mismatch = (mismatch + "；" + extra) if mismatch else extra
+                mismatch = ("ranging 市压趋势跟随", rp)
+            elif reg == "high_vol":
+                mismatch = ("高波动统压", rp * 0.5)
             if mismatch:
-                avg = round(avg - rp * (1.0 if reg != "high_vol" else 0.5), 2)
+                text, amt = mismatch
+                avg = round(avg - amt, 2)
                 p["regime_penalty"] = True
-                p["reason"] = (p.get("reason") or "") + f"（regime={reg}，{mismatch}）"
+                p["regime_note"] = f"regime={reg}，{text} −{amt}"
 
             p["avg_score"] = avg
             p["qualify"] = (len(scores) >= MIN_JUDGE_VOTES

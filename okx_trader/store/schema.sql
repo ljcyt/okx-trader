@@ -49,7 +49,9 @@ CREATE TABLE IF NOT EXISTS proposals (
   slot INTEGER NOT NULL,                  -- ANALYSTS 中的序号（含弃权者）
   analyst TEXT NOT NULL, style TEXT, action TEXT NOT NULL,   -- open|hold
   inst_id TEXT, direction TEXT, stop_loss REAL, entry_hint REAL,
-  confidence REAL, reason TEXT,
+  confidence REAL, reason TEXT,         -- LLM 原话，系统注解走 regime_note
+  regime_penalty INTEGER NOT NULL DEFAULT 0,
+  regime_note TEXT,                     -- regime 门控的系统注解
   avg_score REAL, votes_for INTEGER, votes_total INTEGER,
   qualify INTEGER, is_winner INTEGER NOT NULL DEFAULT 0,
   UNIQUE (round_pk, slot)

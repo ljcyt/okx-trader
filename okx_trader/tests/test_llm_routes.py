@@ -97,8 +97,7 @@ class QuorumEventTest(unittest.TestCase):
         from okx_trader.committee import Committee
         store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
         cfg = type("C", (), {"SYMBOLS": ["BTC-USDT-SWAP"],
-                             "SCORE_THRESHOLD": 6.5,
-                             "HALLUCINATION_PENALTY": 2.0})()
+                             "SCORE_THRESHOLD": 6.5})()
         cm = Committee.__new__(Committee)
         cm.cfg, cm.threshold, cm.store, cm.env = cfg, 6.5, store, "replay"
         cm.llm = type("L", (), {"available": False})()

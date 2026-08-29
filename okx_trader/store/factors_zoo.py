@@ -220,7 +220,9 @@ def score_factors(store, gate, bar="1H", env="paper"):
 
     统计修正：
     - n_eff：重叠前向收益（4b/24b）共享 K 线，有效样本 = n/hz。
-      ic_t 和 gate 的 min_obs 都用 n_eff——否则 24b 的 t 值虚高 ~5 倍。
+      ic_t 用 n_eff 修正（否则 24b 的 t 值虚高 ~5 倍）；gate 的 min_obs
+      仍按原始观测数——数据充足性与统计显著性是两道独立守卫，显著性
+      由 BH 校正把守，min_obs 再套 n_eff 是重复计数同一修正。
     - BH/FDR：33 次检验在 α=0.05 下的期望假阳性 1.65 个；对当批 p 值做
       Benjamini-Hochberg 校正，gate_passed 建立在校正后的显著性上——
       未证明的因子永不影响下单。

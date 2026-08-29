@@ -225,7 +225,12 @@ async function renderRoundDetail(rid) {
       <span class="chip ${p.action === "open" ? "opened" : "no_action"}">${p.action === "open" ? "OPEN" : "ABSTAIN"}</span></div>`;
     if (p.action === "open")
       html += `<div>${esc(p.inst_id)} ${p.direction === "long" ? "做多" : "做空"} · 止损 ${fmt(p.stop_loss)} · 置信度 ${fmt(p.confidence)}</div>`;
-    html += `<div class="wrap muted">${esc(p.reason)}</div></div>`;
+    html += `<div class="wrap muted">${esc(p.reason)}</div>`;
+    if (p.regime_penalty)
+      html += `<div class="chip data_unavailable">regime 扣分</div> <div class="wrap muted">${esc(p.regime_note || "")}</div>`;
+    if (p.hallucinated)
+      html += `<div class="chip data_unavailable">数字存疑</div> <div class="wrap muted">${esc(JSON.stringify(p.hallucinated))}</div>`;
+    html += `</div>`;
   }
   html += `</div></div>`;
 
