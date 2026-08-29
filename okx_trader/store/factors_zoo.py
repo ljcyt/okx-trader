@@ -83,6 +83,13 @@ def collect_from_report(store, round_pk, inst_id, report, bar):
             value = None
         if value is None or not math.isfinite(value):
             continue
+        # 零方差守卫：某因子已积累 ≥8 条且全部等值（demo 的 oi_delta 恒 0
+        # 之类）→ 继续入库只会占观测额度，std=0 永远算不出 IC
+        flat = store.query_one(
+            "SELECT COUNT(*) c, MIN(value) mn, MAX(value) mx FROM factor_obs "
+            "WHERE factor=? AND inst_id=?", (name, inst_id))
+        if flat and flat["c"] >= 8 and flat["mx"] == flat["mn"] == value:
+            continue
         store.execute(
             "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, round_pk, "
             "value) VALUES (?,?,?,?,?)",

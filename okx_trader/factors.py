@@ -15,16 +15,21 @@ import time
 
 
 def regime_label(report, cfg):
-    """市况标签（代码判定，不问模型）：
-    adx_proxy = |EMA20-EMA60|/ATR —— 趋势强度的廉价代理。"""
+    """市况标签（代码判定，不问模型），带方向：
+        trending_up / trending_down —— |EMA20-EMA60|/ATR ≥ TREND_THRESHOLD
+        high_vol 优先于趋势判定（ATR% 超阈值时方向不可信）
+    阈值实测校准：旧 0.45 让 BTC(1.29)/ETH(1.29)/SOL(0.49) 全部读 trending，
+    且与报告 trend 字段互相矛盾（EMA20<EMA60 却判 trending）——分位数校准
+    留 TODO，先提至 1.0。"""
     atr = report.get("atr") or 0
+    ema20, ema60 = report.get("ema20"), report.get("ema60")
     adx_proxy = 0.0
-    if atr and report.get("ema20") is not None and report.get("ema60") is not None:
-        adx_proxy = abs(report["ema20"] - report["ema60"]) / atr
+    if atr and ema20 is not None and ema60 is not None:
+        adx_proxy = abs(ema20 - ema60) / atr
     if report.get("atr_pct", 0) > getattr(cfg, "HIGH_VOL_ATR_PCT", 0.03):
         return "high_vol"
-    if adx_proxy > getattr(cfg, "TREND_THRESHOLD", 0.45):
-        return "trending"
+    if adx_proxy >= getattr(cfg, "TREND_THRESHOLD", 1.0):
+        return "trending_up" if ema20 > ema60 else "trending_down"
     return "ranging"
 
 
@@ -336,11 +341,15 @@ def build_factor_report(cfg, client, inst_id):
     ccy = inst_id.split("-")[0]
     obi_raw = client.get_orderbook(inst_id, depth=20)
     obi = None
+    # 订单簿失衡：极端读数（<5% 或 >95%）说明前 20 档近乎单边——
+    # 模拟盘订单簿稀薄时常见（实测 99%），不可信，弃采
     if obi_raw:
         bid_qty = sum(q for _, q in obi_raw["bids"][:20])
         ask_qty = sum(q for _, q in obi_raw["asks"][:20])
         if bid_qty + ask_qty > 0:
-            obi = bid_qty / (bid_qty + ask_qty)  # >0.5 买盘厚
+            ratio = bid_qty / (bid_qty + ask_qty)
+            if 0.05 < ratio < 0.95:
+                obi = ratio
 
     oi_hist = client.get_oi_history(inst_id, period=bar, limit=2)
     oi, oi_delta_pct = None, None

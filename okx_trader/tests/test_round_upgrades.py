@@ -107,8 +107,9 @@ class HallucinationRecordOnlyTest(unittest.TestCase):
     def test_recorded_without_penalty(self):
         store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
         cm = make_committee(store)
+        # style=funding：ranging 市不触发 regime 门控，测试只验证幻觉行为
         cm._ask_analyst = lambda *a, **k: {
-            "action": "open", "analyst": "X", "style": "trend",
+            "action": "open", "analyst": "X", "style": "funding",
             "instId": "BTC-USDT-SWAP", "direction": "long",
             "stop_loss": 77000.0, "confidence": 0.6,
             "reason": "RSI 暴涨到 99.9 所以做多"}
@@ -176,15 +177,21 @@ class RevisionLoopTest(unittest.TestCase):
 
 
 class RegimeTest(unittest.TestCase):
-    cfg = type("C", (), {"HIGH_VOL_ATR_PCT": 0.03, "TREND_THRESHOLD": 0.45})()
+    cfg = type("C", (), {"HIGH_VOL_ATR_PCT": 0.03, "TREND_THRESHOLD": 1.0})()
 
     def test_high_vol(self):
         r = {"atr_pct": 0.05, "ema20": 100.0, "ema60": 100.2, "atr": 1.0}
         self.assertEqual(regime_label(r, self.cfg), "high_vol")
 
-    def test_trending(self):
+    def test_trending_up(self):
+        # EMA20 在上、gap 2.0 ≥ 阈值 1.0 → trending_up
         r = {"atr_pct": 0.01, "ema20": 102.0, "ema60": 100.0, "atr": 1.0}
-        self.assertEqual(regime_label(r, self.cfg), "trending")   # adx=2.0
+        self.assertEqual(regime_label(r, self.cfg), "trending_up")
+
+    def test_trending_down(self):
+        # EMA20 在下、gap 2.0 → trending_down（方向性）
+        r = {"atr_pct": 0.01, "ema20": 100.0, "ema60": 102.0, "atr": 1.0}
+        self.assertEqual(regime_label(r, self.cfg), "trending_down")
 
     def test_ranging(self):
         r = {"atr_pct": 0.01, "ema20": 100.1, "ema60": 100.0, "atr": 1.0}
@@ -194,7 +201,7 @@ class RegimeTest(unittest.TestCase):
         f = {"A": {"atr_pct": 0.01, "ema20": 102, "ema60": 100, "atr": 1},
              "B": {"atr_pct": 0.01, "ema20": 102.2, "ema60": 100, "atr": 1},
              "C": {"atr_pct": 0.05, "ema20": 1, "ema60": 1, "atr": 1}}
-        self.assertEqual(overall_regime(f, self.cfg), "trending")   # 2:1 投票
+        self.assertEqual(overall_regime(f, self.cfg), "trending_up")   # 2:1 投票
 
 
 if __name__ == "__main__":

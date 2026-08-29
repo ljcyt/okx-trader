@@ -321,19 +321,25 @@ class Committee:
                 else:
                     self.store.state_set(self.env, streak_key, 0)
 
-            # regime 门控：趋势市压均值回归、震荡市压趋势、高波动统压——
-            # 否则强趋势里"多头排列"和"RSI 超买"会同时成立，两个人设对同一
-            # 标的出相反提案而裁判无从取舍
+            # regime 门控（方向性）：趋势市压均值回归、震荡市压趋势、趋势方向
+            # 与提案方向相悖也压——否则强趋势里两个相反人设对同一标的各提一案
             style = p.get("style")
             reg = p.get("regime")
             rp = float(getattr(self.cfg, "REGIME_MISMATCH_PENALTY", 1.0) or 0)
             mismatch = None
-            if reg == "trending" and style == "meanrev":
-                mismatch = f"trending 市压均值回归 −{rp}"
+            if reg in ("trending_up", "trending_down"):
+                if style == "meanrev":
+                    mismatch = f"{reg} 市压均值回归 −{rp}"
+                elif style == "trend":
+                    if reg == "trending_up" and p.get("direction") == "short":
+                        mismatch = f"trending_up 市压趋势做空 −{rp}"
+                    elif reg == "trending_down" and p.get("direction") == "long":
+                        mismatch = f"trending_down 市压趋势做多 −{rp}"
             elif reg == "ranging" and style == "trend":
                 mismatch = f"ranging 市压趋势跟随 −{rp}"
-            elif reg == "high_vol":
-                mismatch = f"高波动统压 −{rp * 0.5}"
+            if reg == "high_vol":
+                extra = f"高波动统压 −{rp * 0.5}"
+                mismatch = (mismatch + "；" + extra) if mismatch else extra
             if mismatch:
                 avg = round(avg - rp * (1.0 if reg != "high_vol" else 0.5), 2)
                 p["regime_penalty"] = True

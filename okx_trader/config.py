@@ -103,7 +103,7 @@ _DEFAULTS = {
         {"dd": 0.10, "risk_mult": 0.0, "allow_open": False, "flatten": True},
     ],
     "HIGH_VOL_ATR_PCT": 0.03,
-    "TREND_THRESHOLD": 0.45,
+    "TREND_THRESHOLD": 1.0,
     "HALLUCINATION_PENALTY": 2.0,
     "MAX_REVISIONS": 1,
     "PAPER_EQUITY": 10000.0,
