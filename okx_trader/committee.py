@@ -20,22 +20,28 @@ from .store import write as w
 # 裁判法定人数：有效票不足此数时提案不能胜出（防止 LLM 超时导致单裁判独裁）
 MIN_JUDGE_VOTES = 2
 # 同一人设连续出现幻觉数字达到该次数 → 降为 observing（只记录意见，不参与授权）
-HALLUCINATION_DEMOTE_STREAK = 3
+HALLUCINATION_DEMOTE_STREAK = 5
 
 
 def fmt_score(v):
     return "—" if v is None else f"{float(v):.1f}"
 
 
-def verify_numbers(reason, report_text, own=()):
+def verify_numbers(reason, report_text, own=(), extra_own=()):
     """防幻觉闸门（代码做，不靠模型自觉）：
-    提案 reason 里引用的数字必须能在该标的因子报告原文里找到。
+    提案 reason 里引用的数字必须能在【全部标的的因子报告原文】里找到
+    （LLM 提示词含三份报告，跨标的引用是合法论证）。
+
+    豁免清单：
+      own       —— 提案自己算出的字段（止损/入场/置信度）
+      extra_own —— 方法论常量（ATR_STOP_MULT、MIN_RR 等，来自配置）；
+                    否则"止损放 1.5×ATR"会被当成幻觉误报并实扣 2 分
 
     容差按量级分档（相对误差）：
         >=1000（价格类）0.05% —— 否则 BTC ±0.5% = ±400，闸门形同虚设
         1~1000（RSI/比率）0.5%
         <1（费率/小占比）5%
-    连字符数字区间先规约（"2515-2538" 是两个数字，不是 "-2538"）；
+    连字符/波浪线数字区间先规约（"2515-2538"、"104~104.58" 各是两个数字）；
     原始值与百分号写法（0.0001 vs 0.0100%）互相兼容。
     返回对不上号的数字列表。"""
     import re
@@ -50,7 +56,8 @@ def verify_numbers(reason, report_text, own=()):
         # 认识科学计数法：factors.py 若用 %g 渲染 ≥1e5 的值会产出 8.027e+04，
         # 旧正则会把它切成 '8.027' 和 '04' 两个垃圾 token——既造成误报
         # （引用真实 EMA 被判幻觉）又造成漏报（幻觉 8.03 撞上垃圾 8.027）
-        text = re.sub(r"(?<=\d)\s*[-\u2013]\s*(?=\d)", "，", str(text or ""))
+        # 连字符与波浪线区间都规约成独立数字（"2515-2538"、"104~104.58"）
+        text = re.sub(r"(?<=\d)\s*[-\u2013~]\s*(?=\d)", "，", str(text or ""))
         return re.findall(r"-?\d+\.?\d*(?:[eE][+-]?\d+)?%?", text)
 
     def _match(cv, pool):
@@ -78,7 +85,7 @@ def verify_numbers(reason, report_text, own=()):
     cited = _tokens(reason)
     pool = [_num(t) for t in _tokens(report_text)]
     pool = [p for p in pool if p is not None]
-    own_vals = [_num(o) for o in own]
+    own_vals = [_num(o) for o in list(own) + list(extra_own)]
     own_vals = [o for o in own_vals if o is not None]
     missing = []
     for c in cited:
@@ -270,9 +277,17 @@ class Committee:
         自动降为 observing——只记录意见，不再参与授权。
         """
         penalty = float(getattr(self.cfg, "HALLUCINATION_PENALTY", 2.0) or 0)
-        factor_texts = {inst: format_one(r)
-                        for inst, r in (snapshot.get("factors") or {}).items()
-                        if r}
+        # 池子用【全部标的】的报告原文——LLM 收到的提示词含三份报告，
+        # 跨标的引用（如引用 ETH 的 FVG 来论证 SOL）是合法论证
+        all_reports_text = " NEWLINE_JOIN ".join(
+            format_one(r) for r in (snapshot.get("factors") or {}).values() if r)
+        all_reports_text = all_reports_text.replace(" NEWLINE_JOIN ", chr(10))
+        # 方法论常量白名单："止损放 1.5×ATR" 这类正当表述不是幻觉
+        consts = [getattr(self.cfg, k, None) for k in (
+            "ATR_STOP_MULT", "TARGET_ATR_MULT", "MIN_RR", "MIN_TARGET_ATR",
+            "MAX_RISK_PER_TRADE", "LEVERAGE", "MIN_STOP_DIST_PCT",
+            "MAX_STOP_DIST_PCT", "SCORE_THRESHOLD", "MAKER_PRICE_OFFSET")]
+        consts = [float(c) for c in consts if c is not None]
         quorum_short = False
         for i, p in enumerate(proposals):
             rows = [row for row in judging["rows"] if row["idx"] == i]
@@ -282,32 +297,31 @@ class Committee:
             p["votes"] = f"{votes}/{len(rows) or len(JUDGES)}"
 
             missing = verify_numbers(
-                p.get("reason"),
-                factor_texts.get(p.get("instId"), ""),
+                p.get("reason"), all_reports_text,
                 own=[p.get("stop_loss"), p.get("entry_hint"),
-                     p.get("confidence")])
+                     p.get("confidence")] + consts)
             if missing:
                 # 检出即扣分——不依赖 store 是否可用
                 avg = round(avg - penalty, 2)
                 p["hallucinated"] = missing
             if self.store is not None:
+                # 误报的代价太大：禁言只在【连续 5 轮】幻觉时生效且【不持久】——
+                # 干净轮次 streak 衰减 1（而非清零），两轮干净即脱离降级
                 streak_key = f"hallu_streak_{p.get('analyst')}"
-                flag_key = f"hallu_demoted_{p.get('analyst')}"
                 if missing:
                     streak = int(self.store.state_get(self.env, streak_key) or 0) + 1
                     self.store.state_set(self.env, streak_key, streak)
                     if streak >= HALLUCINATION_DEMOTE_STREAK:
-                        # 降级是持久的：置位后不随干净轮次清零（恢复需人工删 key）
-                        self.store.state_set(self.env, flag_key, True)
+                        p["demoted"] = True
                         w.write_event(
                             self.store, self.env, "hallucinated_number",
-                            f"{p.get('analyst')} 连续 {streak} 轮出现幻觉数字，"
-                            f"降为 observing（只记录意见，不参与授权）",
+                            f"{p.get('analyst')} 连续 {streak} 轮幻觉数字，"
+                            f"本轮降为 observing（连续两轮干净自动恢复）",
                             level="warn")
                 else:
-                    self.store.state_set(self.env, streak_key, 0)
-                if bool(self.store.state_get(self.env, flag_key)):
-                    p["demoted"] = True
+                    streak = int(self.store.state_get(self.env, streak_key) or 0)
+                    if streak > 0:
+                        self.store.state_set(self.env, streak_key, max(0, streak - 1))
                 if missing:
                     w.write_event(
                         self.store, self.env, "hallucinated_number",

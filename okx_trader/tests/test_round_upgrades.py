@@ -96,46 +96,48 @@ class VerifyNumbersTest(unittest.TestCase):
         self.assertEqual(verify_numbers("EMA20 80270 站稳", report), [])
 
 
-class DemotionPersistenceTest(unittest.TestCase):
-    """中：降级必须持久——连续 3 轮幻觉后，第 4 轮干净也保持 observing。"""
+SNAP_UP = {'equity': 10000.0, 'positions': [], 'drawdown': 0.0,
+           'factors': {'BTC-USDT-SWAP': make_report()}}
 
-    def test_demotion_persists_after_clean_round(self):
-        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+
+class DemotionTest(unittest.TestCase):
+    """降级设计（改良版）：连续 5 轮幻觉才降级；干净轮衰减 1、两轮干净即恢复。"""
+
+    def _cm(self, store):
         cm = make_committee(store)
-        hallucinated_reason = "RSI 暴涨到 99.9 所以做多"
-        clean_reason = "RSI 55.0 中性，ATR 400 正常，观望为主，止损 77000.0"
         cm._ask_analyst = lambda *a, **k: {
             "action": "open", "analyst": "X", "style": "trend",
             "instId": "BTC-USDT-SWAP", "direction": "long",
             "stop_loss": 77000.0, "confidence": 0.6,
-            "reason": hallucinated_reason}
+            "reason": "RSI 暴涨到 99.9 所以做多"}          # 幻觉数字
         cm._ask_judges = lambda *a, **k: {"rows": [
             {"idx": 0, "judge": f"J{i}", "score": 9.0, "approved": True,
              "concerns": ""} for i in range(3)]}
-        for _ in range(3):                       # 连续 3 轮幻觉 → 降级
-            cm.decide(SNAP)
-        cm._ask_analyst = lambda *a, **k: {      # 第 4 轮干净
-            "action": "open", "analyst": "X", "style": "trend",
-            "instId": "BTC-USDT-SWAP", "direction": "long",
-            "stop_loss": 77000.0, "confidence": 0.6, "reason": clean_reason}
-        d = cm.decide(SNAP)
-        p = next(p for p in d["analysts"] if p["analyst"] == "X")
-        self.assertTrue(p.get("demoted"), "降级必须持久，不随干净轮次清零")
-        self.assertFalse(p.get("qualify"))       # 不参与授权（仍记录）
+        return cm
 
-    def test_penalty_without_store(self):
-        # 中：惩罚与 store 解耦——没有持久层也要扣分
-        cm = make_committee(store=None)
+    def test_no_demotion_below_threshold(self):
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cm = self._cm(store)
+        cm.decide(SNAP_UP)
+        p = next(a for a in cm.decide(SNAP_UP)["analysts"] if a["analyst"] == "X")
+        self.assertFalse(p.get("demoted"))     # 2 轮 < 5 → 不降级
+
+    def test_demotion_at_threshold_and_recovery(self):
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        cm = self._cm(store)
+        for _ in range(5):                     # 连续 5 轮幻觉 → 降级
+            cm.decide(SNAP_UP)
+        p = next(a for a in cm.decide(SNAP_UP)["analysts"] if a["analyst"] == "X")
+        self.assertTrue(p.get("demoted"))
+        # 干净两轮后恢复（streak 衰减 5→3→... 需 5 轮；阈值语义：streak<5 即恢复）
         cm._ask_analyst = lambda *a, **k: {
             "action": "open", "analyst": "X", "style": "trend",
             "instId": "BTC-USDT-SWAP", "direction": "long",
             "stop_loss": 77000.0, "confidence": 0.6,
-            "reason": "RSI 暴涨到 99.9 所以做多"}
-        cm._ask_judges = lambda *a, **k: {"rows": [
-            {"idx": 0, "judge": f"J{i}", "score": 9.0, "approved": True,
-             "concerns": ""} for i in range(3)]}
-        d = cm.decide(SNAP)
-        self.assertEqual(d["scoreboard"][0]["avg_score"], 7.0)  # 9 − 2
+            "reason": "RSI 55.0 正常，ATR 400 正常，止损 77000.0"}
+        d = cm.decide(SNAP_UP)
+        p = next(a for a in d["analysts"] if a["analyst"] == "X")
+        self.assertFalse(p.get("demoted"))     # 干净轮衰减后恢复
 
 
 class HallucinationPenaltyTest(unittest.TestCase):

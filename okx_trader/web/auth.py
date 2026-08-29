@@ -26,8 +26,10 @@ _lock = threading.Lock()
 
 
 def check_password(password, cfg) -> bool:
-    expected = getattr(cfg, "WEB_PASSWORD", "") or ""
-    return secrets.compare_digest(str(password), str(expected))
+    expected = str(getattr(cfg, "WEB_PASSWORD", "") or "")
+    # encode 成 bytes：compare_digest 对含非 ASCII 的 str 会直接 TypeError
+    return secrets.compare_digest(str(password).encode("utf-8"),
+                                  expected.encode("utf-8"))
 
 
 def login(password, cfg, ip):

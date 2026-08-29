@@ -230,3 +230,17 @@ def write_llm_call(store, round_pk, role, model, ok, err=None, latency_ms=None,
         "VALUES (?,?,?,?,?,?,?,?,?,?)",
         (round_pk, role, model, int(ok), err, latency_ms, prompt_tokens,
          completion_tokens, raw_reply, cost_usd))
+
+
+def mark_order_filled(store, env, exch_ord_id, filled_sz, avg_px, trade_pk=None):
+    """成交确认：把 entry 订单行回填为 filled 并挂上 trade_pk（对账闭环）。"""
+    store.execute(
+        "UPDATE orders SET state='filled', filled_sz=?, avg_px=?, trade_pk=?, "
+        "updated_ts=? WHERE env=? AND exch_ord_id=?",
+        (filled_sz, avg_px, trade_pk, time.time(), env, str(exch_ord_id)))
+
+
+def link_protect_to_trade(store, env, exch_algo_id, trade_pk):
+    store.execute(
+        "UPDATE orders SET trade_pk=? WHERE env=? AND exch_algo_id=?",
+        (trade_pk, env, str(exch_algo_id)))

@@ -482,6 +482,8 @@ class TradingLoop:
                 m["trade_pk"] = pk
                 meta[inst_id] = m
                 changed = True
+                w.mark_order_filled(self.store, self.env.name, wo["ord_id"],
+                                    p["contracts"], p["avg_px"], trade_pk=pk)
                 self.log.info("巡检：%s 工作单盘中成交，已补记 trades（pk=%s）", inst_id, pk)
         if changed:
             self.risk.state.set_positions_meta(meta)
@@ -656,6 +658,13 @@ class TradingLoop:
             trade_pk = open_trade_row(self, rw, sized, filled,
                                       order["avg_px"] or sized.get("entry_ref"))
             execution["trade_pk"] = trade_pk
+            # 对账闭环：入场单回填为 filled 并与 trade 关联；保护单挂到同一 trade
+            w.mark_order_filled(self.store, self.env.name, ord_id, filled,
+                                order["avg_px"] or sized.get("entry_ref"),
+                                trade_pk)
+            if execution.get("stop_algo_id"):
+                w.link_protect_to_trade(self.store, self.env.name,
+                                        execution["stop_algo_id"], trade_pk)
             meta = self.risk.state.get_positions_meta()
             meta[inst_id] = {
                 "direction": direction, "stop": stop, "target": tp,
