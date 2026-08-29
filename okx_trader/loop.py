@@ -442,6 +442,17 @@ class TradingLoop:
             if m.get("trade_pk"):
                 continue
             wo = working.get(inst_id)
+            # 幂等防护：meta 丢了 trade_pk 但 open 行已在（如崩溃窗口半截
+            # 记账）——只把 meta/订单重新挂链，绝不重复建行
+            dup = self.store.query_one(
+                "SELECT id FROM trades WHERE env=? AND inst_id=? "
+                "AND status='open' ORDER BY id DESC LIMIT 1",
+                (self.env.name, inst_id))
+            if dup:
+                m["trade_pk"] = dup["id"]
+                meta[inst_id] = m
+                changed = True
+                continue
             sized = {"instId": inst_id, "direction": p["direction"],
                      "stop_loss": m.get("stop") or (wo or {}).get("stop"),
                      "target": m.get("target") or (wo or {}).get("target"),

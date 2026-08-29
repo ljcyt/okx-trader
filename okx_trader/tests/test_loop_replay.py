@@ -216,6 +216,23 @@ class PatrolBackfillTest(unittest.TestCase):
         meta = loop.risk.state.get_positions_meta()[INST]
         self.assertEqual(meta["trade_pk"], tr["id"])
 
+    def test_fill_backfill_is_idempotent_when_open_row_exists(self):
+        """meta 丢了 trade_pk 但 open 行已在（崩溃窗口半截记账）→ 不重复建行。"""
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": True}])
+        entry = maker_fill_px(78000.0)
+        rw1 = w.RoundWriter.open(loop.store, "round_1", 1.0, "replay", 1, "baseline")
+        self.assertEqual(loop._execute_open(sized_plan(entry=entry), rw1)["status"],
+                         "opened")                 # 正常开仓，trades pk=1
+        loop.risk.state.set_positions_meta(        # 模拟 meta 丢 trade_pk
+            {INST: {"direction": "long", "stop": 77900.0}})
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        rows = loop.store.query("SELECT id, status FROM trades")
+        self.assertEqual(len(rows), 1)             # 没有重复行
+        meta = loop.risk.state.get_positions_meta()[INST]
+        self.assertEqual(meta["trade_pk"], rows[0]["id"])  # meta 已接回
+
     def test_fill_backfill_links_existing_protect(self):
         """保护单先于补记存在（止损先挂上、trade 后补）→ 挂链到同一 trade。"""
         tmp = tempfile.mkdtemp(prefix="okxpb-")
