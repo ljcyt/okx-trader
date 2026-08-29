@@ -485,6 +485,8 @@ class OKXClient:
             "posSide": (self._pos_side_for_close(side) if reduce_only
                         else self._pos_side(side)),
             "reduceOnly": "true" if reduce_only else "",
+            # 现货和合约模式（acctLv=2）要求显式声明自成交预防模式
+            "stpMode": "cancel_maker",
         }
         if cl_ord_id:
             payload["clOrdId"] = cl_ord_id
