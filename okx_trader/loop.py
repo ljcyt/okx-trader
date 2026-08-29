@@ -312,11 +312,14 @@ class TradingLoop:
             # 把胜出分析师/委员会分带进 sized → trades 归因用（Phase 3 落库）
             verdict.sized["analyst"] = plan.get("analyst")
             verdict.sized["committee_score"] = plan.get("committee_score")
+            verdict.kelly = getattr(self.risk, "last_kelly", None)
             winner_pk = self._winner_proposal_pk(decision, slot_pks)
             rw.write_risk({"passed": verdict.passed,
                            "failures": verdict.failures,
                            "warnings": verdict.warnings,
-                           "sized": verdict.sized}, proposal_pk=winner_pk)
+                           "sized": verdict.sized,
+                           "kelly": getattr(self.risk, "last_kelly", None)},
+                          proposal_pk=winner_pk)
             if not verdict.passed:
                 rw.finish("risk_rejected", action="open",
                           reason="；".join(verdict.failures),

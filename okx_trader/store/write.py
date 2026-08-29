@@ -149,12 +149,14 @@ class RoundWriter:
         m = re.match(r"(R\d)", failures[0]) if failures else None
         # 非规则码的失败（如行情异常）归 OTHER，保证 GROUP BY 完整
         sized = verdict.get("sized") or {}
+        kelly = verdict.get("kelly") or {}
         self.store.execute(
             "INSERT INTO risk_verdicts(round_pk, proposal_pk, passed, rule_code, "
             "first_failure, failures_json, warnings_json, inst_id, direction, "
             "contracts, entry_ref, stop_loss, target, rr, target_source, "
-            "notional_usdt, risk_usdt, risk_pct, atr, leverage_after) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "notional_usdt, risk_usdt, risk_pct, atr, leverage_after, "
+            "kelly_mult, edge_p, edge_b, kelly_n, kelly_note) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.pk, proposal_pk, int(bool(verdict.get("passed"))),
              (m.group(1) if m else ("OTHER" if failures else None)),
              failures[0] if failures else None,
@@ -164,7 +166,9 @@ class RoundWriter:
              sized.get("stop_loss"), sized.get("target"), sized.get("rr"),
              sized.get("target_source"), sized.get("notional_usdt"),
              sized.get("risk_usdt"), sized.get("risk_pct"), sized.get("atr"),
-             sized.get("leverage_after")))
+             sized.get("leverage_after"),
+             kelly.get("mult"), kelly.get("p"), kelly.get("b"),
+             kelly.get("n"), kelly.get("note")))
 
     # ── 订单 / 权益 / 事件 / run_state ──────────────────────────────
 

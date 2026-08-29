@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS risk_verdicts (
   inst_id TEXT, direction TEXT, contracts REAL, entry_ref REAL, stop_loss REAL,
   target REAL, rr REAL,
   target_source TEXT,    -- 'structure' | 'atr_multiple' —— R7 的目标从哪来
-  notional_usdt REAL, risk_usdt REAL, risk_pct REAL, atr REAL, leverage_after REAL
+  notional_usdt REAL, risk_usdt REAL, risk_pct REAL, atr REAL, leverage_after REAL,
+  kelly_mult REAL, edge_p REAL, edge_b REAL, kelly_n INTEGER, kelly_note TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rv_rule ON risk_verdicts(rule_code, round_pk DESC);
 

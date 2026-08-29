@@ -74,7 +74,12 @@ _DEFAULTS = {
     "MAX_OPEN_POSITIONS": 3,
     "MAX_DRAWDOWN": 0.10,
     "SAME_DIRECTION_RISK_CAP": 0.02,
-    "REGIME_MISMATCH_PENALTY": 1.0,   # 人设与市况错配时的提案扣分  # 同方向持仓的聚合风险上限（高相关标的同向=放大beta）
+    "REGIME_MISMATCH_PENALTY": 1.0,
+    "KELLY_ENABLED": False,           # 影子模式：kelly_mult 照算照入库，不改仓位
+    "KELLY_FRACTION": 0.5,            # 分数 Kelly（半 Kelly）
+    "KELLY_MIN_MULT": 0.25,           # 系数地板（风险最低缩到 0.25%）
+    "KELLY_MIN_SAMPLES": 30,          # 显著性门槛：每人设最少已平仓样本
+    "KELLY_SIG_LEVEL": 0.05,          # 二项检验显著性水平   # 人设与市况错配时的提案扣分  # 同方向持仓的聚合风险上限（高相关标的同向=放大beta）
     "MAKER_PRICE_OFFSET": 0.0,       # 0=平齐买一/卖一（post_only 保证 maker）
     "ORDER_TIMEOUT_SEC": 90,
     "ATR_PERIOD": 14,
