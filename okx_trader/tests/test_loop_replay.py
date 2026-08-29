@@ -32,6 +32,7 @@ def make_loop(tmp, script, max_hold=24):
     cfg = load_config()
     cfg.TRADING_ENV = "replay"
     cfg.ORDER_TIMEOUT_SEC = 0          # 回放中成交即刻判定，零等待
+    cfg.MAKER_PRICE_OFFSET = 0.0005    # 显式固定——不随本机/CI 配置缺省漂移
     cfg.MAX_HOLD_BARS = max_hold
     loop = TradingLoop(cfg=cfg, env_name="replay",
                        store=Store(os.path.join(tmp, "trader.db")))
