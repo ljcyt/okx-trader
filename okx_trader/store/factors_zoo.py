@@ -110,7 +110,11 @@ def backfill_returns(store, client, bar="1H", horizons=("1b", "4b", "24b"),
     for row in pending_insts:
         inst = row["inst_id"]
         try:
-            closes, oldest_ts = _fetch_closes_paged(client, inst, bar)
+            need_oldest = store.query_one(
+                "SELECT MIN(bar_ts) m FROM factor_obs "
+                "WHERE inst_id=? AND filled_ts IS NULL", (inst,))["m"]
+            closes, oldest_ts = _fetch_closes_paged(client, inst, bar,
+                                                    need_oldest_ts=need_oldest)
         except Exception as e:  # noqa: BLE001 —— 失败必须可见，不能静默空转
             client.log.warning(
                 "backfill_returns：%s K 线拉取失败（%s: %s）——本标的观测保持 pending",
@@ -148,9 +152,10 @@ def backfill_returns(store, client, bar="1H", horizons=("1b", "4b", "24b"),
     return total
 
 
-def _fetch_closes_paged(client, inst, bar):
-    """拉 close 序列，覆盖最近 _CANDLE_PAGE 根 + 向更旧翻页直到连续两页空。
-    返回 ({ts: close}, oldest_ts)。"""
+def _fetch_closes_paged(client, inst, bar, need_oldest_ts=None):
+    """拉 close 序列（升序）。单页 300，after 游标向更旧翻页；
+    覆盖到 need_oldest_ts（最早的待回填观测）即停——稳态只有 1 页，
+    不会每次都拉满 _MAX_PAGES×300 根。返回 ({ts: close}, oldest_ts)。"""
     closes = {}
     after = None
     oldest = None
@@ -165,6 +170,8 @@ def _fetch_closes_paged(client, inst, bar):
         if oldest is not None and page_oldest >= oldest:
             break  # 游标不再前进（到头了）
         oldest = page_oldest
+        if need_oldest_ts is not None and oldest <= need_oldest_ts:
+            break  # 已覆盖最早的待回填观测 → 按需停
         after = oldest  # after=返回比该 ts 更旧的记录
     return closes, (oldest or 0)
 
@@ -266,7 +273,11 @@ def score_factors(store, gate, bar="1H", env="paper"):
 
 
 def _zscore_by_inst(obs):
-    """value 按标的 z-score 后摊平（跨标的混算前去量纲）。std=0 的标的全 0。"""
+    """value 按标的 z-score 后摊平（跨标的混算前去量纲）。std=0 的标的全 0。
+
+    ⚠ 备查：这里用全样本均值/标准差，某条观测的 z 值依赖它之后的数据——
+    对"固定样本上的描述性 IC"是标准做法，没问题；但这个 helper 一旦被搬到
+    实时信号路径上就是真正的未来函数，届时必须改滚动窗口。"""
     by_inst = {}
     for o in obs:
         by_inst.setdefault(o["inst_id"], []).append(o["value"])

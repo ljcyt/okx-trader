@@ -399,11 +399,11 @@ def format_factor_report(r):
     vol_s = f"{r['vol_ratio']:.2f}" if r.get("vol_ratio") is not None else "—"
     lines = [
         f"{r['instId']}（{r['bar']}，截至 {r['time']}）",
-        f"  价格 {r['price']:g}；EMA20 {r['ema20']:.4g} / EMA60 {r['ema60']:.4g}"
+        f"  价格 {r['price']:g}；EMA20 {r['ema20']:g} / EMA60 {r['ema60']:g}"
         f" → {r['trend']}；市场结构：{r['structure']}",
-        f"  MACD：DIF {macd['dif']:.4g} / DEA {macd['dea']:.4g} / 柱 {macd['hist']:.4g}"
+        f"  MACD：DIF {macd['dif']:g} / DEA {macd['dea']:g} / 柱 {macd['hist']:g}"
         f"（{macd['state']}）",
-        f"  RSI14 {rsi_s}；ATR {r['atr']:.4g}（{r['atr_pct']:.2%}）；"
+        f"  RSI14 {rsi_s}；ATR {r['atr']:g}（{r['atr_pct']:.2%}）；"
         f"布林宽 {r['boll']['width_pct']:.2%}，价格{r['price_vs_boll']}",
         f"  量比 {vol_s}；资金费率 {r['funding_rate']:+.4%}；"
         f"末根K线形态：{r['pattern']}",

@@ -83,6 +83,18 @@ class VerifyNumbersTest(unittest.TestCase):
         m = verify_numbers("阻力 2515-2538 一带压制", "阻力位 2515、2538")
         self.assertEqual(m, [])
 
+    def test_scientific_notation_pool(self):
+        """复查遗留：%g 渲染 ≥1e5 会产出 8.027e+04——tokenize 必须认识
+        科学计数法，否则引用真实 EMA 被误报、幻觉的 8.03 反而漏报。"""
+        report = ("价格 80300；EMA20 8.027e+04 / EMA60 7.988e+04 → 多头排列；"
+                  "ATR 402.1（0.50%）")
+        # 引用真实的 EMA60 → 不能误报
+        self.assertEqual(verify_numbers("EMA60 79880.2 附近有支撑", report), [])
+        # 幻觉的 8.03 不能撞上垃圾 token 通过（旧正则会漏报）
+        self.assertEqual(verify_numbers("EMA20 已到 8.03", report), ["8.03"])
+        # 原始十进制引用同一数值也命中
+        self.assertEqual(verify_numbers("EMA20 80270 站稳", report), [])
+
 
 class DemotionPersistenceTest(unittest.TestCase):
     """中：降级必须持久——连续 3 轮幻觉后，第 4 轮干净也保持 observing。"""

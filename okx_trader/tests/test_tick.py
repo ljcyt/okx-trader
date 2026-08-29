@@ -152,6 +152,18 @@ class DrawdownLadderTest(unittest.TestCase):
         self.assertFalse(v.passed)
         self.assertTrue(any("R5" in f for f in v.failures))
 
+    def test_equity_zero_triggers_top_tier(self):
+        """复查遗留：权益恰好 0.0 不能被真值判断当成 falsy 跳过——
+        那正是最该触发末档（全平+停机）的状态。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8d-"))
+        loop.risk.state.update_hwm(10000.0)
+        loop.client.equity = 0.0                   # 爆仓级
+        rw = type("RW", (), {"pk": None,
+                             "write_order": lambda *a, **k: None})()
+        loop._evaluate_drawdown_ladder(rw, equity=0.0, hwm=10000.0)
+        self.assertEqual(loop.risk.state.get_rung(), 3)
+        self.assertTrue(loop.paused)
+
     def test_risk_mult_halves_budget_at_rung1(self):
         self.loop.risk.state.set_rung(1)        # 第 1 档：risk_mult=0.5
         self.loop.client.script = [{"price": 78000.0}]

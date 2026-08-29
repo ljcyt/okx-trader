@@ -690,7 +690,8 @@ class TradingLoop:
         snap = {"positions": positions, "factors": factors}
         self._patrol_positions(snap, tick_rw)
         manage_open_positions(self, snap, tick_rw)
-        if equity:
+        # is not None 而非真值判断：权益恰好 0.0（爆仓级回撤）正是最该触发末档的时刻
+        if equity is not None and hwm is not None and dd is not None:
             self._evaluate_drawdown_ladder(tick_rw, equity=equity, hwm=hwm)
             w.write_equity(self.store, self.env.name, time.time(),
                            equity, hwm, dd, eq["usdt_avail"], None,
@@ -701,9 +702,10 @@ class TradingLoop:
 
     def _evaluate_drawdown_ladder(self, rw, equity, hwm):
         """回撤阶梯（升档立即生效；降档需回撤 < 当前档阈值 80%，防抖动）。
-        equity/hwm 由调用方传入（tick 每次新采样，round 用当轮快照）。"""
+        equity/hwm 由调用方传入（tick 每次新采样，round 用当轮快照）。
+        注意用 is not None：权益 0.0 是最该触发末档的状态，不能当 falsy 跳过。"""
         ladder = list(getattr(self.cfg, "DRAWDOWN_LADDER", []) or [])
-        if not ladder or not equity or not hwm:
+        if not ladder or equity is None or hwm is None or hwm <= 0:
             return
         drawdown = (hwm - equity) / hwm
         rung = self.risk.state.get_rung()

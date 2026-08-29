@@ -46,16 +46,24 @@ def verify_numbers(reason, report_text, own=()):
             return None
 
     def _tokens(text):
+        # 认识科学计数法：factors.py 若用 %g 渲染 ≥1e5 的值会产出 8.027e+04，
+        # 旧正则会把它切成 '8.027' 和 '04' 两个垃圾 token——既造成误报
+        # （引用真实 EMA 被判幻觉）又造成漏报（幻觉 8.03 撞上垃圾 8.027）
         text = re.sub(r"(?<=\d)\s*[-\u2013]\s*(?=\d)", "，", str(text or ""))
-        return re.findall(r"-?\d+\.?\d*%?", text)
+        return re.findall(r"-?\d+\.?\d*(?:[eE][+-]?\d+)?%?", text)
 
     def _match(cv, pool):
         for t in pool:
             if abs(cv - t) <= _tol(cv) * max(abs(cv), abs(t), 1e-9):
                 return True
-            # 原始值 vs 百分号写法互认：0.0001 ↔ 0.0100%
-            if abs(cv * 100 - t) <= _tol(cv) * max(abs(cv * 100), abs(t), 1e-9):
-                return True
+            # 原始值 ↔ 百分号写法双向互认：0.0001 ↔ 0.0100%、0.01 ↔ 1。
+            # 只对费率量级（|cv|<0.1）启用——对大数启用会让 99.9 撞上
+            # 报告里 "1H" 切出来的 1 这类偶然 token，闸门彻底失效
+            if abs(cv) < 0.1:
+                if abs(cv * 100 - t) <= _tol(cv) * max(abs(cv * 100), abs(t), 1e-9):
+                    return True
+                if abs(cv / 100 - t) <= _tol(cv) * max(abs(cv / 100), abs(t), 1e-9):
+                    return True
         return False
 
     def _tol(v):

@@ -201,6 +201,27 @@ class FactorZooTest(unittest.TestCase):
         self.assertEqual(pending, 0)               # 全部回填完成
         self.assertGreater(filled, 0)
 
+    def test_backfill_steady_state_single_page(self):
+        """按需翻页：只有最近 bar 的观测时，稳态 1 页就该覆盖全部回填。"""
+        store = make_store()
+        client = ReplayStubClient(self.CLOSES, max_page=300)
+        n = len(self.CLOSES)
+        for i in range(n - 40, n - 26):            # 最近但不贴边（24b 目标已收盘）
+            bar_ts = client.t0 + i * client.bar_ms
+            store.execute(
+                "INSERT OR IGNORE INTO factor_defs(name, family, tier, status, "
+                "source, created_ts, status_ts) VALUES "
+                "('fake','momentum','derived','observing','builtin',?,?)",
+                (time.time(), time.time()))
+            store.execute(
+                "INSERT OR IGNORE INTO factor_obs(factor, inst_id, bar_ts, value) "
+                "VALUES ('fake','BTC-USDT-SWAP',?,?)", (bar_ts, float(i)))
+        backfill_returns(store, client)
+        self.assertEqual(client.page_calls, 1)     # 没有多余翻页
+        pending = store.query_one(
+            "SELECT COUNT(*) c FROM factor_obs WHERE filled_ts IS NULL")["c"]
+        self.assertEqual(pending, 0)
+
     def test_scored_days_counts_bar_dates_not_backfill_dates(self):
         """中：scored_days 必须数观测 bar_ts 的自然日——补跑/重放把整批
         观测盖上同一个 filled_ts 也不影响计分日。"""
