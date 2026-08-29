@@ -321,6 +321,16 @@ def build_factor_report(cfg, client, inst_id):
     boll = bollinger(closes)
     atr = _atr(candles, period=cfg.ATR_PERIOD)
     funding = client.get_funding_rate(inst_id)
+    # 资金费率滚动分位：当前费率在近 90 周期里的分位（0~1）——
+    # 绝对阈值（|费率|≥0.05%）对主流币基本不可达，分位数才是"拥挤"的正确度量
+    funding_rank = None
+    try:
+        hist = client.get_funding_history(inst_id, limit=90)
+        if hist and len(hist) >= 20:
+            cur = funding["funding_rate"]
+            funding_rank = sum(1 for h in hist if h["rate"] <= cur) / len(hist)
+    except Exception:  # noqa: BLE001
+        funding_rank = None
 
     dif, dea, hist = macd_v
     ccy = inst_id.split("-")[0]
@@ -365,6 +375,7 @@ def build_factor_report(cfg, client, inst_id):
                           "下轨下方" if price < boll[2] else "轨道内"),
         "vol_ratio": volume_ratio(candles),
         "funding_rate": funding["funding_rate"],
+        "funding_rank": funding_rank,
         "pattern": candle_pattern(candles[-1]),
         # ── 扩展因子（确定性 Skills）──
         "patterns": detect_patterns(candles),                    # 最近3根经典形态
@@ -405,8 +416,10 @@ def format_factor_report(r):
         f"（{macd['state']}）",
         f"  RSI14 {rsi_s}；ATR {r['atr']:g}（{r['atr_pct']:.2%}）；"
         f"布林宽 {r['boll']['width_pct']:.2%}，价格{r['price_vs_boll']}",
-        f"  量比 {vol_s}；资金费率 {r['funding_rate']:+.4%}；"
-        f"末根K线形态：{r['pattern']}",
+        f"  量比 {vol_s}；资金费率 {r['funding_rate']:+.4%}"
+        + (f"（近90期分位 {r['funding_rank']:.0%}）"
+           if r.get("funding_rank") is not None else "")
+        + f"；末根K线形态：{r['pattern']}",
     ]
     if r.get("patterns"):
         lines.append(f"  近3根形态：{'、'.join(r['patterns'])}")

@@ -147,6 +147,7 @@ class RoundWriter:
     def write_risk(self, verdict, proposal_pk=None):
         failures = verdict.get("failures", [])
         m = re.match(r"(R\d)", failures[0]) if failures else None
+        # 非规则码的失败（如行情异常）归 OTHER，保证 GROUP BY 完整
         sized = verdict.get("sized") or {}
         self.store.execute(
             "INSERT INTO risk_verdicts(round_pk, proposal_pk, passed, rule_code, "
@@ -155,7 +156,7 @@ class RoundWriter:
             "notional_usdt, risk_usdt, risk_pct, atr, leverage_after) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (self.pk, proposal_pk, int(bool(verdict.get("passed"))),
-             m.group(1) if m else None,
+             (m.group(1) if m else ("OTHER" if failures else None)),
              failures[0] if failures else None,
              _json(failures), _json(verdict.get("warnings", [])),
              sized.get("instId"), sized.get("direction"),

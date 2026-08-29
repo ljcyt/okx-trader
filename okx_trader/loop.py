@@ -77,6 +77,14 @@ class RunState:
     def set_paused_state(self, paused):
         self.store.state_set(self.env, "paused", bool(paused))
 
+    # 工作单名册（挂单策略：未成交报价留盘口覆盖整轮）
+    def get_working_orders(self):
+        v = self.store.state_get(self.env, "working_orders")
+        return v or {}
+
+    def set_working_orders(self, working):
+        self.store.state_set(self.env, "working_orders", working or {})
+
     # 持仓元数据（崩溃对账用）
     def get_positions_meta(self):
         v = self.store.state_get(self.env, "positions_meta")
@@ -130,7 +138,13 @@ class TradingLoop:
             for event, floor in (("data_degraded", "warn"),
                                  ("circuit_breaker", "warn"),
                                  ("naked_position", "critical"),
-                                 ("trade_closed", "info")):
+                                 ("trade_closed", "info"),
+                                 ("order_placed", "info"),
+                                 ("order_filled", "info"),
+                                 ("time_stop", "warn"),
+                                 ("trailing_stop", "info"),
+                                 ("risk_rejected", "info"),
+                                 ("round_done", "info")):
                 hook_register(event, make_hook(url, floor))
 
     @staticmethod
@@ -326,6 +340,9 @@ class TradingLoop:
                 else:
                     hook_trigger("risk_rejected", {"kind": "risk_rejected",
                                  "level": "info",
+                                 "inst_id": verdict.sized.get("instId"),
+                                 "direction": verdict.sized.get("direction"),
+                                 "score": verdict.sized.get("committee_score"),
                                  "message": "；".join(verdict.failures)})
                 return out
 
@@ -350,9 +367,13 @@ class TradingLoop:
             out.update({"status": status, "execution": execution})
             if status == "opened":
                 hook_trigger("order_filled", {"kind": "order_filled", "level": "info",
-                             "message": f"{verdict.sized['instId']} "
-                                        f"{verdict.sized['direction']} 开仓"
-                                        f"（{verdict.sized['contracts']} 张）"})
+                             "inst_id": verdict.sized["instId"],
+                             "direction": verdict.sized["direction"],
+                             "contracts": verdict.sized["contracts"],
+                             "avg_px": out.get("execution", {}).get("avg_fill_px"),
+                             "stop": stop, "target": tp or None,
+                             "equity": (self.last_snapshot or {}).get("equity"),
+                             "message": "成交，交易所保护单（止损/止盈）已挂"})
         except Exception as e:  # noqa: BLE001 —— 单轮失败不影响下一轮
             self.log.error("本轮异常：%s\n%s", e, traceback.format_exc())
             try:
@@ -364,8 +385,13 @@ class TradingLoop:
             out["error"] = str(e)
         finally:
             self._busy = False
+        snap = self.last_snapshot or {}
         hook_trigger("round_done", {"kind": "round_done", "level": "info",
-                                    "message": out.get("status", "?")})
+                     "equity": snap.get("equity"),
+                     "drawdown": snap.get("drawdown"),
+                     "positions_n": len(snap.get("positions") or []),
+                     "regime": out.get("regime"),
+                     "message": f"status={out.get('status')}，{out.get('decision') or ''}"})
         return out
 
     @staticmethod
@@ -382,8 +408,10 @@ class TradingLoop:
 
     def _patrol_positions(self, snap, rw):
         """开轮对账（只有会真实下单的环境才动账）：
-        1. 撤残留孤儿挂单；2. 清理已平仓元数据；3. 给无保护持仓补挂止损。"""
+        1. 工作单生命周期（未成交报价留盘口覆盖整轮，超龄撤换）；
+        2. 清理已平仓元数据；3. 撤孤儿挂单；4. 补挂缺失保护单；5. 盘中成交补记。"""
         meta = self.risk.state.get_positions_meta()
+        working = self.risk.state.get_working_orders()
         live = {p["instId"]: p for p in snap["positions"]}
 
         changed = False
@@ -391,15 +419,42 @@ class TradingLoop:
             if inst_id not in live:
                 self.log.info("巡检：%s 仓位已离场，回填交易记录并清理元数据", inst_id)
                 reconcile_closed_trade(self, snap, rw, inst_id, meta)
+                working.pop(inst_id, None)
                 changed = True
 
         if not self.executing:
             if changed:
                 self.risk.state.set_positions_meta(meta)
+                self.risk.state.set_working_orders(working)
             return
 
+        # ── 工作单生命周期 ──
+        now = time.time()
+        requote = int(getattr(self.cfg, "REQUOTE_AGE_SEC", 900) or 900)
+        for inst_id in list(working.keys()):
+            wo = working[inst_id]
+            if inst_id in live:
+                try:  # 已成交 → 撤掉可能残余的工作单
+                    self.client.cancel_order(inst_id, wo["ord_id"])
+                except Exception:  # noqa: BLE001
+                    pass
+                working.pop(inst_id)
+                changed = True
+                continue
+            if now - wo.get("placed_ts", 0) > requote:
+                try:
+                    self.client.cancel_order(inst_id, wo["ord_id"])
+                    self.log.warning("巡检：报价超龄（>%ds 未成交），撤单 %s（%s）"
+                                     "等待重新评估", requote, wo["ord_id"][:8], inst_id)
+                    working.pop(inst_id)
+                    changed = True
+                except Exception as e:  # noqa: BLE001
+                    self.log.warning("巡检：撤工作单失败 %s：%s", wo["ord_id"][:8], e)
+
+        # 撤残留孤儿挂单：不在工作单名册里的才算残留
+        working_ids = {w["ord_id"] for w in working.values()}
         for o in self.client.get_pending_orders():
-            if o["instId"] in self.cfg.SYMBOLS:
+            if o["instId"] in self.cfg.SYMBOLS and str(o["ordId"]) not in working_ids:
                 try:
                     self.client.cancel_order(o["instId"], o["ordId"])
                     self.log.warning("巡检：撤销残留挂单 %s（%s）", o["ordId"][:8], o["instId"])
@@ -408,6 +463,29 @@ class TradingLoop:
                                    state="canceled", note="巡检撤销残留挂单")
                 except Exception as e:  # noqa: BLE001
                     self.log.warning("巡检：撤单失败 %s：%s", o["ordId"][:8], e)
+
+        # 盘中成交：工作单在等待期外成交 → 撤残余 + 补记 trades 行
+        for inst_id, p in live.items():
+            wo = working.get(inst_id)
+            if wo and not (meta.get(inst_id) or {}).get("trade_pk"):
+                try:
+                    self.client.cancel_order(inst_id, wo["ord_id"])
+                except Exception:  # noqa: BLE001
+                    pass
+                m = meta.get(inst_id) or {}
+                sized = {"instId": inst_id, "direction": p["direction"],
+                         "stop_loss": m.get("stop"), "target": m.get("target"),
+                         "rr": None, "risk_usdt": m.get("risk_usdt"),
+                         "analyst": m.get("analyst"),
+                         "committee_score": m.get("committee_score")}
+                pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"])
+                m["trade_pk"] = pk
+                meta[inst_id] = m
+                changed = True
+                self.log.info("巡检：%s 工作单盘中成交，已补记 trades（pk=%s）", inst_id, pk)
+        if changed:
+            self.risk.state.set_positions_meta(meta)
+            self.risk.state.set_working_orders(working)
 
         for inst_id, p in live.items():
             try:
@@ -515,6 +593,14 @@ class TradingLoop:
         rw.write_order(self.env.name, inst_id, "entry", "post_only",
                        exch_ord_id=str(ord_id), side=side,
                        px=sized.get("entry_ref"), sz=contracts, state="live")
+        hook_trigger("order_placed", {"kind": "order_placed", "level": "info",
+                     "inst_id": inst_id, "direction": direction,
+                     "contracts": contracts, "px": sized.get("entry_ref"),
+                     "stop": stop, "target": tp or None,
+                     "notional_usdt": sized.get("notional_usdt"),
+                     "risk_usdt": sized.get("risk_usdt"),
+                     "message": f"Maker 限价单已挂（post_only），"
+                                f"等待成交（最长 {self.cfg.ORDER_TIMEOUT_SEC}s）"})
         execution = {"ord_id": ord_id, "contracts_planned": contracts,
                      "stop_px": stop, "tp_px": tp, "direction": direction}
 
@@ -537,21 +623,24 @@ class TradingLoop:
 
         filled = order["acc_fill_sz"]
         if filled <= 0:
+            # 未成交：报价保留在工作面上覆盖整轮（挂单策略核心），
+            # 超龄撤换与盘中成交补记由巡检（risk_tick / 下轮开头）处理
+            working = self.risk.state.get_working_orders()
+            working[inst_id] = {"ord_id": str(ord_id), "side": side,
+                                "px": order.get("px") or sized.get("entry_ref"),
+                                "sz": contracts,
+                                "placed_ts": time.time(),
+                                "stop": stop, "target": tp,
+                                "analyst": sized.get("analyst")}
+            self.risk.state.set_working_orders(working)
+            execution["status"] = "working"
+            execution["working"] = True
+            self.log.info("限价单未即时成交，保留为工作单 %s（%s %s @%s）覆盖盘口",
+                          ord_id, inst_id, side, order.get("px"))
+            return execution
+        if order["state"] in ("live", "partially_filled"):
             try:
-                self.client.cancel_order(inst_id, ord_id)
-                execution["canceled"] = True
-            except Exception as e:  # noqa: BLE001
-                order = self.client.get_order(inst_id, ord_id)
-                filled = order["acc_fill_sz"]
-                execution["fill_state"] = order["state"]
-                execution["filled_contracts"] = filled
-                execution["cancel_error"] = str(e)
-                if filled <= 0:
-                    execution["status"] = "no_fill"
-                    return execution
-        elif order["state"] in ("live", "partially_filled"):
-            try:
-                self.client.cancel_order(inst_id, ord_id)  # 撤掉未成交的剩余部分
+                self.client.cancel_order(inst_id, ord_id)  # 部分成交：撤掉残余
             except Exception:  # noqa: BLE001
                 pass
 

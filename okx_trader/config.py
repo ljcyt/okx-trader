@@ -73,7 +73,9 @@ _DEFAULTS = {
     "MAX_TOTAL_LEVERAGE": 3.0,
     "MAX_OPEN_POSITIONS": 3,
     "MAX_DRAWDOWN": 0.10,
-    "MAKER_PRICE_OFFSET": 0.0005,
+    "SAME_DIRECTION_RISK_CAP": 0.02,
+    "REGIME_MISMATCH_PENALTY": 1.0,   # 人设与市况错配时的提案扣分  # 同方向持仓的聚合风险上限（高相关标的同向=放大beta）
+    "MAKER_PRICE_OFFSET": 0.0,       # 0=平齐买一/卖一（post_only 保证 maker）
     "ORDER_TIMEOUT_SEC": 90,
     "ATR_PERIOD": 14,
     "ATR_BAR": "1H",
@@ -89,6 +91,7 @@ _DEFAULTS = {
     "FACTOR_GATE": {"scored_days": 15, "days_tracked": 30,
                     "require_positive_rank_ic": True, "min_obs": 100},
     "RISK_TICK_SEC": 300,
+    "REQUOTE_AGE_SEC": 900,          # 工作单超过 15 分钟未成交 → 撤单，下轮重新报价
     "DRAWDOWN_LADDER": [
         {"dd": 0.04, "risk_mult": 0.5, "allow_open": True},
         {"dd": 0.07, "risk_mult": 0.25, "allow_open": False},

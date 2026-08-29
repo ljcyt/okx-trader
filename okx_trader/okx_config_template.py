@@ -37,12 +37,14 @@ SYMBOLS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
 MAX_RISK_PER_TRADE = 0.01     # 单笔最大亏损 ≤ 账户权益的 1%
 MAX_TOTAL_LEVERAGE = 3
 TRAIL_ATR_MULT = 1.0          # 移动止损：跟在价格极值后 1×ATR（浮盈 1R 前先推保本）
-MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓.0      # 总杠杆上限：全部仓位名义市值之和 / 账户权益
+MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓
 MAX_OPEN_POSITIONS = 3        # 最多同时持有的仓位数量
 MAX_DRAWDOWN = 0.10           # 回撤熔断：权益自历史高点回撤超过 10% 禁止开新仓
+SAME_DIRECTION_RISK_CAP = 0.02
+REGIME_MISMATCH_PENALTY = 1.0  # 人设×市况错配扣分（趋势市压均值回归等）  # 同方向持仓聚合风险上限（BTC/ETH/SOL 高相关，同向=放大beta）
 
 # 订单参数
-MAKER_PRICE_OFFSET = 0.0005   # Maker 限价单相对买一/卖一的偏移比例（0.05%）
+MAKER_PRICE_OFFSET = 0.0     # 0 = 平齐买一/卖一挂单（post_only 保证 maker）；0.0005 = 前方 0.05%
 ORDER_TIMEOUT_SEC = 90        # 限价单最长等待成交时间，超时未成交自动撤单
 
 # 波动率 / 止损参数（第三步风控模块用）
@@ -57,8 +59,6 @@ TARGET_ATR_MULT = 2.5         # 无可用结构位时的 ATR 兜底目标倍数
 
 # 杠杆
 LEVERAGE = 3
-TRAIL_ATR_MULT = 1.0          # 移动止损：跟在价格极值后 1×ATR（浮盈 1R 前先推保本）
-MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓                  # 单合约杠杆（开仓前自动设置；总杠杆另受 MAX_TOTAL_LEVERAGE 约束）
 
 PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 
@@ -87,7 +87,6 @@ LLM_ROUTES = {}
 # 模型价目表（USD / 1M tokens）：未列出的模型 cost 记 NULL，面板显示"未计价"
 LLM_PRICES = {}
 # LLM_PRICES = {"gpt-4o": {"in": 2.5, "out": 10.0}}
-LLM_ENDPOINTS = []            # 多端点 failover（按序切换），单端点用 LLM_API_BASE 即可
 LLM_TIMEOUT_SEC = 60
 
 # 日志与数据

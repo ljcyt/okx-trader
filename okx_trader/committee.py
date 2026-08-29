@@ -13,6 +13,7 @@ LLM 模式：每个 agent 独立调用模型（同一模型不同人设 prompt�
 """
 import time
 
+from .factors import regime_label
 from .llm import LLMClient
 from .store import write as w
 
@@ -108,8 +109,8 @@ ANALYSTS = [
     {
         "name": "资金哨兵", "style": "funding",
         "prompt": ("你是「资金哨兵」，关注资金费率透露的头寸拥挤度："
-                   "资金费率显著为正(≥+0.05%)说明多头拥挤→倾向做空；"
-                   "显著为负(≤-0.05%)→倾向做多；费率中性→弃权。"
+                   "费率处于近90期高分位（≥90%分位，多头极度拥挤）→倾向做空；"
+                   "低分位（≤10%，空头极度拥挤）→倾向做多；分位中性→弃权。"
                    "你必须同时参考趋势因子，逆势单要求更紧的止损。"),
     },
 ]
@@ -172,6 +173,11 @@ class Committee:
                 proposals.append(prop)
         self.log.info("委员会：分析师产出 %d 份有效提案 / %d 份弃权",
                       len(proposals), len(analyst_log) - len(proposals))
+        # regime 标签（代码判定）：人设 × 市况的匹配度在聚合时用作扣分项
+        for p in proposals:
+            rep = (snapshot.get("factors") or {}).get(p.get("instId"))
+            if rep:
+                p["regime"] = regime_label(rep, self.cfg)
 
         if not proposals:
             return {"action": "hold", "mode": self.llm_mode_name(),
@@ -308,6 +314,24 @@ class Committee:
                         f"{p.get('analyst')} 提案引用了因子报告里不存在的数字："
                         f"{missing}（连续第 {int(self.store.state_get(self.env, streak_key) or 0)} 次）",
                         level="warn")
+
+            # regime 门控：趋势市压均值回归、震荡市压趋势、高波动统压——
+            # 否则强趋势里"多头排列"和"RSI 超买"会同时成立，两个人设对同一
+            # 标的出相反提案而裁判无从取舍
+            style = p.get("style")
+            reg = p.get("regime")
+            rp = float(getattr(self.cfg, "REGIME_MISMATCH_PENALTY", 1.0) or 0)
+            mismatch = None
+            if reg == "trending" and style == "meanrev":
+                mismatch = f"trending 市压均值回归 −{rp}"
+            elif reg == "ranging" and style == "trend":
+                mismatch = f"ranging 市压趋势跟随 −{rp}"
+            elif reg == "high_vol":
+                mismatch = f"高波动统压 −{rp * 0.5}"
+            if mismatch:
+                avg = round(avg - rp * (1.0 if reg != "high_vol" else 0.5), 2)
+                p["regime_penalty"] = True
+                p["reason"] = (p.get("reason") or "") + f"（regime={reg}，{mismatch}）"
 
             p["avg_score"] = avg
             p["qualify"] = (len(scores) >= MIN_JUDGE_VOTES
@@ -492,52 +516,72 @@ def _f(x):
 
 
 def _baseline_analyst(style, ctx):
-    """ctx: {"reports": {instId: factor_report}, "held": set, "atr_mult": cfg值}"""
+    """ctx: {"reports": {instId: factor_report}, "held": set}
+
+    横截面选优：遍历【全部】标的收集候选、按信号强度取最优——
+    旧写法第一个命中就 return，结构上永远偏向 SYMBOLS 列表头部的 BTC。"""
     reports, held, cfg = ctx["reports"], ctx["held"], ctx["cfg"]
     stop_mult = cfg.ATR_STOP_MULT
+    best = None
+
     for inst_id in cfg.SYMBOLS:
         r = reports.get(inst_id)
         if not r or inst_id in held:
             continue
         price, atr = r["price"], r["atr"]
+        cand = None
 
         if style == "trend":
             mtf = r.get("mtf") or {}
             t4h = (mtf.get("4H") or {}).get("trend", "")
             if "多头排列" in r["trend"] and r["rsi14"] < 75 and "下降" not in t4h:
-                return {"action": "open", "instId": inst_id, "direction": "long",
+                cand = {"action": "open", "instId": inst_id, "direction": "long",
                         "stop_loss": round(price - stop_mult * atr, 4),
                         "confidence": 0.65, "order_type": "limit_maker",
                         "reason": f"多头排列+MACD{r['macd']['state']}，4H不逆势，趋势做多"}
-            if "空头排列" in r["trend"] and r["rsi14"] > 25 and "上升" not in t4h:
-                return {"action": "open", "instId": inst_id, "direction": "short",
+            elif "空头排列" in r["trend"] and r["rsi14"] > 25 and "上升" not in t4h:
+                cand = {"action": "open", "instId": inst_id, "direction": "short",
                         "stop_loss": round(price + stop_mult * atr, 4),
                         "confidence": 0.65, "order_type": "limit_maker",
                         "reason": f"空头排列+MACD{r['macd']['state']}，4H不逆势，趋势做空"}
         elif style == "meanrev":
             if r["rsi14"] >= 70 and "上轨" in r["price_vs_boll"]:
-                return {"action": "open", "instId": inst_id, "direction": "short",
+                cand = {"action": "open", "instId": inst_id, "direction": "short",
                         "stop_loss": round(price + 1.0 * atr, 4),
                         "confidence": 0.5, "order_type": "limit_maker",
                         "reason": f"RSI {r['rsi14']:.0f} 超买且触布林上轨，回归做空"}
-            if r["rsi14"] <= 30 and "下轨" in r["price_vs_boll"]:
-                return {"action": "open", "instId": inst_id, "direction": "long",
+            elif r["rsi14"] <= 30 and "下轨" in r["price_vs_boll"]:
+                cand = {"action": "open", "instId": inst_id, "direction": "long",
                         "stop_loss": round(price - 1.0 * atr, 4),
                         "confidence": 0.5, "order_type": "limit_maker",
                         "reason": f"RSI {r['rsi14']:.0f} 超卖且触布林下轨，回归做多"}
         elif style == "funding":
             fr = r["funding_rate"]
-            if fr >= 0.0005:
-                return {"action": "open", "instId": inst_id, "direction": "short",
+            rank = r.get("funding_rank")
+            # 分位优先（近90期滚动），绝对阈值兜底——主流币费率长期贴 0.01%，绝对阈值不可达
+            if rank is not None and rank >= 0.9:
+                cand = {"action": "open", "instId": inst_id, "direction": "short",
                         "stop_loss": round(price + 1.2 * atr, 4),
-                        "confidence": 0.45, "order_type": "limit_maker",
-                        "reason": f"资金费率 {fr:+.3%} 多头拥挤，逆向做空"}
-            if fr <= -0.0005:
-                return {"action": "open", "instId": inst_id, "direction": "long",
+                        "confidence": 0.45 + 0.1 * (rank - 0.9) * 10,
+                        "order_type": "limit_maker",
+                        "reason": f"资金费率 {fr:+.3%} 处于 {rank:.0%} 分位（多头拥挤），逆向做空"}
+            elif rank is not None and rank <= 0.1:
+                cand = {"action": "open", "instId": inst_id, "direction": "long",
                         "stop_loss": round(price - 1.2 * atr, 4),
+                        "confidence": 0.45 + 0.1 * (0.1 - rank) * 10,
+                        "order_type": "limit_maker",
+                        "reason": f"资金费率 {fr:+.3%} 处于 {rank:.0%} 分位（空头拥挤），逆向做多"}
+            elif abs(fr) >= 0.0005:
+                d = "short" if fr > 0 else "long"
+                side_px = price + (1.2 * atr if fr > 0 else -1.2 * atr)
+                cand = {"action": "open", "instId": inst_id, "direction": d,
+                        "stop_loss": round(side_px, 4),
                         "confidence": 0.45, "order_type": "limit_maker",
-                        "reason": f"资金费率 {fr:+.3%} 空头拥挤，逆向做多"}
-    return {"action": "hold", "reason": "无符合人设信号"}
+                        "reason": f"资金费率 {fr:+.3%} 极端（无分位数据），逆向"}
+
+        if cand and (best is None or cand["confidence"] > best["confidence"]):
+            best = cand
+    return best or {"action": "hold", "reason": "无符合人设信号"}
 
 
 def _baseline_judge(judge_name, p, snapshot, cfg):

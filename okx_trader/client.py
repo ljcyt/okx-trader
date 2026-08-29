@@ -300,6 +300,18 @@ class OKXClient:
             "ts": int(d.get("ts") or 0),
         }
 
+    def get_funding_history(self, inst_id, limit=90):
+        """资金费率历史（升序），用于计算当前费率的滚动分位。"""
+        try:
+            resp = self._call("funding_rate_history",
+                              self.public.get_funding_rate_history,
+                              inst_id, limit=str(limit))
+            rows = list(reversed(resp.get("data", [])))
+            return [{"ts": int(r[0]), "rate": float(r[1])} for r in rows]
+        except Exception as e:  # noqa: BLE001
+            self.log.debug("资金费率历史获取失败：%s", e)
+            return None
+
     def get_funding_rate(self, inst_id):
         """当前资金费率。"""
         resp = self._call("get_funding_rate", self.public.get_funding_rate, inst_id)
@@ -442,11 +454,13 @@ class OKXClient:
 
     def maker_price(self, inst_id, side, px=None, price_offset_ratio=None):
         """计算 Maker 限价单的委托价（下单价与纸面模拟共用）。
-        不传 px 时：买单挂在买一下方、卖单挂在卖一上方，保证只做 Maker。"""
+        ratio=0：平齐买一/卖一（post_only 保证 maker，成交无需价格跌进区间）；
+        ratio>0：挂在盘口后方。默认 0——旧版挂在买一下方导致报价 97.5% 的
+        时间不在市场上，且只有价格逆向跌入才成交（结构性逆向选择）。"""
         if px is None:
             ratio = price_offset_ratio
             if ratio is None:
-                ratio = getattr(self.cfg, "MAKER_PRICE_OFFSET", 0.0005)
+                ratio = getattr(self.cfg, "MAKER_PRICE_OFFSET", 0.0)
             ticker = self.get_ticker(inst_id)
             ref = ticker["bid"] if side == "buy" else ticker["ask"]
             if not ref:

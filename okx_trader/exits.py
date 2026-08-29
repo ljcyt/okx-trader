@@ -13,6 +13,7 @@
 """
 import time
 
+from .hooks import trigger as hook_trigger
 from .store import write as w
 
 
@@ -93,6 +94,10 @@ def manage_open_positions(loop, snap, rw):
                                   f"{inst} 止损上移 {current_stop:.4g}→{desired:.4g}"
                                   f"（浮盈 {r_now:.2f}R）",
                                   inst_id=inst, round_pk=rw.pk)
+                    hook_trigger("trailing_stop", {"kind": "trailing_stop", "level": "info",
+                                 "inst_id": inst,
+                                 "message": f"止损 {current_stop:.4g} → {desired:.4g}"
+                                            f"（浮盈 {r_now:.2f}R）"})
                     loop.log.info("移动止损：%s %.4g → %.4g（%.2fR）",
                                   inst, current_stop, desired, r_now)
                 except Exception as e:  # noqa: BLE001
@@ -115,6 +120,9 @@ def manage_open_positions(loop, snap, rw):
                     w.write_event(loop.store, loop.env.name, "time_stop",
                                   f"{inst} 持有 {held_bars:.1f} 根且 |PnL|<0.3R，市价平仓",
                                   level="warn", inst_id=inst, round_pk=rw.pk)
+                    hook_trigger("time_stop", {"kind": "time_stop", "level": "warn",
+                                 "inst_id": inst,
+                                 "message": f"持有 {held_bars:.1f} 根、{r_now:+.2f}R，市价平仓"})
                     if tr:
                         reconcile_trade(loop.store, tr, exit_px=mark,
                                         reason="time_stop", close_round_pk=rw.pk,
@@ -154,10 +162,15 @@ def reconcile_closed_trade(loop, snap, rw, inst, meta):
             reason, exit_px = "stop", stop
     reconcile_trade(loop.store, tr, exit_px=exit_px, reason=reason,
                     close_round_pk=rw.pk,
-                    ct_val=loop.client.get_instrument(inst_id)["ctVal"])
+                    ct_val=tr["ct_val"])
     w.write_event(loop.store, loop.env.name, "trade_closed",
                   f"{inst_id} 离场：{reason}，exit≈{exit_px:.4g}",
                   level="info", inst_id=inst_id, round_pk=rw.pk)
+    hook_trigger("trade_closed", {"kind": "trade_closed", "level": "info",
+                 "inst_id": inst_id, "exit_reason": reason,
+                 "realized_pnl": tr["realized_pnl"],
+                 "r_multiple": tr["r_multiple"],
+                 "message": f"出场 {exit_px:.4g}（{reason}）"})
 
 
 def reconcile_trade(store, tr, exit_px, reason, close_round_pk, ct_val):

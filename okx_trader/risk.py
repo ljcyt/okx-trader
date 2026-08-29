@@ -196,6 +196,25 @@ class RiskManager:
             eff_dist = max(stop_dist, atr_dist)
             risk_budget = equity * self.cfg.MAX_RISK_PER_TRADE \
                 * (tier.get("risk_mult", 1.0) if tier else 1.0)
+            # ── R8 同向风险聚合：BTC/ETH/SOL 相关性 ~0.8-0.9，同向持仓本质是
+            #    一笔放大 beta 押注——同向已用风险从本笔预算中扣除，聚合超限直接拒绝
+            cap = float(getattr(self.cfg, "SAME_DIRECTION_RISK_CAP", 0.0) or 0)
+            if cap <= 0:
+                cap = self.cfg.MAX_RISK_PER_TRADE * 2
+            used_usdt = self._same_dir_open_risk(direction)
+            used_frac = used_usdt / equity if equity > 0 else 0.0
+            remaining_frac = cap - used_frac
+            if remaining_frac <= 0:
+                return v.fail(
+                    f"R8: 同向({direction})风险预算耗尽——已有同向持仓风险 "
+                    f"{used_usdt:.0f}U（{used_frac:.2%}）≥ 上限 {cap:.0%}，"
+                    f"一次不利波动会同时打掉所有止损"
+                )
+            if remaining_frac < self.cfg.MAX_RISK_PER_TRADE:
+                shrunk = equity * remaining_frac
+                v.warn(f"R8: 同向({direction})风险已用 {used_frac:.2%}，"
+                       f"本笔预算压缩至 {shrunk:.0f}U（剩 {remaining_frac:.2%}）")
+                risk_budget = min(risk_budget, shrunk)
 
             # 每张合约在有效止损距离下的亏损（USDT 本位）= eff_dist × ctVal
             contracts_raw = risk_budget / (eff_dist * inst["ctVal"])
@@ -298,6 +317,20 @@ class RiskManager:
         for f in v.failures:
             self.log.warning("风控拒绝原因：%s", f)
         return v
+
+    def _same_dir_open_risk(self, direction):
+        """同方向未平仓位的 risk_usdt 之和（来自 trades 表）。
+        无持久层（测试 stub）时返回 0。"""
+        store = getattr(self.state, "store", None)
+        if store is None:
+            return 0.0
+        try:
+            row = store.query(
+                "SELECT COALESCE(SUM(risk_usdt),0) s FROM trades "
+                "WHERE status='open' AND direction=?", (direction,))
+            return float(row[0]["s"] or 0)
+        except Exception:  # noqa: BLE001
+            return 0.0
 
     # ────────────────────────── 回撤熔断 ──────────────────────────
 

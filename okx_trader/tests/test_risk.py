@@ -4,8 +4,9 @@
 运行：python -m unittest okx_trader.tests.test_risk -v   或   python okx_trader/tests/test_risk.py
 （unittest 用例同样可被 pytest 收集执行）
 """
-import sys
 import os
+import sys
+import tempfile
 import unittest
 
 try:  # GBK 控制台兜底；包在 try 里以便 pytest 收集时不炸
@@ -13,7 +14,9 @@ try:  # GBK 控制台兜底；包在 try 里以便 pytest 收集时不炸
 except Exception:
     pass
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))  # 仓库根，使 okx_trader 可导入
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+
+from okx_trader.store.db import Store
 
 
 # ── Stub：替代 OKXDemoClient 的最小接口 ─────────────────────────────
@@ -256,6 +259,46 @@ class R7TargetSelectionTest(unittest.TestCase):
             factors={"atr": 400.0, "sr": {"supports": [], "resistances": [81000.0]}}))
         self.assertFalse(v.passed)
         self.assertTrue(any("盈亏比" in f for f in v.failures))
+
+
+class SameDirectionRiskTest(unittest.TestCase):
+    """R8：高相关标的同向持仓的聚合风险约束。"""
+
+    def _rm(self, store, trades_rows):
+        from okx_trader.loop import RunState
+        from okx_trader.risk import RiskManager
+        for t in trades_rows:
+            store.execute(
+                "INSERT INTO trades(env, inst_id, direction, opened_ts, "
+                "contracts, ct_val, entry_px, status, analyst, risk_usdt, "
+                "realized_pnl) VALUES ('demo',?,?,?,?,?,?,?,?,?,NULL)",
+                (t[0], t[1], 1000000.0, 0.01, 0.01, 78000.0, "open",
+                 "测试", t[2]))
+        return RiskManager(make_cfg(), StubClient(), RunState(store, "demo"))
+
+    def test_same_dir_budget_exhausted_rejected(self):
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        rm = self._rm(store, [("BTC-USDT-SWAP", "long", 150.0),
+                              ("ETH-USDT-SWAP", "long", 150.0)])  # 已用 300U = 3%
+        v = rm.check_open_plan(make_plan())   # 新增 1% → 2.6% > 2% 上限
+        self.assertFalse(v.passed)
+        self.assertTrue(any("R8" in f for f in v.failures))
+
+    def test_same_dir_budget_shrinks(self):
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        rm = self._rm(store, [("BTC-USDT-SWAP", "long", 40.0)])  # 已用 40U = 0.4%
+        v = rm.check_open_plan(make_plan(stop_loss=79600.0))  # 预算压缩至 1.5%
+        self.assertTrue(v.passed)
+        self.assertLessEqual(v.sized["risk_usdt"] / 10000.0, 0.015 + 1e-9)
+
+    def test_opposite_direction_not_affected(self):
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        rm = self._rm(store, [("BTC-USDT-SWAP", "long", 0.009)])
+        v = rm.check_open_plan(make_plan(direction="short", stop_loss=80400.0))
+        self.assertTrue(v.passed, f"反向持仓不应占用同向预算: {v.failures}")
 
 
 if __name__ == "__main__":
