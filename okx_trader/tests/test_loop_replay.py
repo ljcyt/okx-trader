@@ -151,5 +151,98 @@ class TradeLifecycleTest(unittest.TestCase):
         self.assertIn(INST, loop.client.positions)
 
 
+class PatrolBackfillTest(unittest.TestCase):
+    """工作单在等待期外/重启间隙成交 → 巡检补记账本。
+
+    回归背景：SOL 入场单在部署重启间隙成交，巡检的补记块因先 pop 工作单
+    而成为死代码，导致交易所有仓位但 trades 表无记录、入场单永远 'live'。"""
+
+    def _place_working(self, loop, script_price=78000.0):
+        """挂单不成交 → 进工作单名册（_execute_open 的 working 分支）。"""
+        entry = maker_fill_px(script_price)
+        rw = w.RoundWriter.open(loop.store, "round_1", 1.0, "replay", 1, "baseline")
+        ex = loop._execute_open(sized_plan(entry=entry), rw)
+        self.assertEqual(ex["status"], "working", f"execution={ex}")
+        self.assertIsNone(loop.store.query_one("SELECT * FROM trades"))
+        return rw, entry, ex["ord_id"]
+
+    def _fill_on_exchange(self, loop, ord_id):
+        """模拟交易所侧成交（本地记账之外，如重启间隙发生的那样）。"""
+        o = loop.client.orders[ord_id]
+        o["state"] = "filled"
+        o["acc_fill_sz"] = o["sz"]
+        o["avg_px"] = o["px"]
+        loop.client._open(INST, "buy", o["sz"], o["px"])
+
+    def test_working_order_fill_backfilled_with_registry(self):
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        _, entry, ord_id = self._place_working(loop)
+        self._fill_on_exchange(loop, ord_id)
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        tr = dict(loop.store.query_one("SELECT * FROM trades"))
+        self.assertEqual(tr["status"], "open")
+        self.assertEqual(tr["analyst"], "趋势猎手")          # 来自工作单名册
+        self.assertAlmostEqual(tr["stop_px"], entry - 100.0, places=6)
+        self.assertAlmostEqual(tr["entry_px"], entry, places=6)
+        order = loop.store.query_one(
+            "SELECT * FROM orders WHERE kind='entry' AND exch_ord_id=?",
+            (ord_id,))
+        self.assertEqual(order["state"], "filled")           # 入场单闭环
+        self.assertEqual(order["trade_pk"], tr["id"])
+        meta = loop.risk.state.get_positions_meta()[INST]
+        self.assertEqual(meta["trade_pk"], tr["id"])
+        # 工作单已清册，且残余挂单被撤
+        self.assertNotIn(INST, loop.risk.state.get_working_orders())
+        self.assertNotEqual(loop.client.orders[ord_id]["state"], "live")
+
+    def test_fill_backfilled_after_registry_lost(self):
+        """名册已丢（上一轮巡检已 pop）→ 按交易所侧入场单回填。"""
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        _, entry, ord_id = self._place_working(loop)
+        loop.risk.state.set_working_orders({})               # 名册丢失
+        self._fill_on_exchange(loop, ord_id)
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        tr = dict(loop.store.query_one("SELECT * FROM trades"))
+        self.assertEqual(tr["status"], "open")
+        order = loop.store.query_one(
+            "SELECT * FROM orders WHERE kind='entry' AND exch_ord_id=?",
+            (ord_id,))
+        self.assertEqual(order["state"], "filled")
+        self.assertEqual(order["trade_pk"], tr["id"])
+        meta = loop.risk.state.get_positions_meta()[INST]
+        self.assertEqual(meta["trade_pk"], tr["id"])
+
+    def test_fill_backfill_links_existing_protect(self):
+        """保护单先于补记存在（止损先挂上、trade 后补）→ 挂链到同一 trade。"""
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        rw1, entry, ord_id = self._place_working(loop)
+        self._fill_on_exchange(loop, ord_id)
+        # 模拟"先补挂了保护单但没建 trades 行"（服务器 SOL 的实际状态：
+        # 巡检补挂保护单已写 orders 行，trade_pk 挂空）
+        algo_id = loop.client.place_stop_loss(INST, "long", 10.0, entry - 100.0)
+        rw1.write_order("replay", INST, "protect", "conditional",
+                        exch_algo_id=str(algo_id), side="sell", sz=10.0,
+                        sl_trigger_px=entry - 100.0, state="live",
+                        note="巡检补挂保护单")
+        loop.risk.state.set_positions_meta(
+            {INST: {"algo_id": str(algo_id), "stop": entry - 100.0}})
+        loop.risk.state.set_working_orders({})               # 名册已丢
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        tr = dict(loop.store.query_one("SELECT * FROM trades"))
+        protect = loop.store.query_one(
+            "SELECT * FROM orders WHERE kind='protect' AND exch_algo_id=?",
+            (str(algo_id),))
+        self.assertIsNotNone(protect)
+        self.assertEqual(protect["trade_pk"], tr["id"])
+        meta = loop.risk.state.get_positions_meta()[INST]
+        self.assertEqual(meta["trade_pk"], tr["id"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

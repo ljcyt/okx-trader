@@ -89,6 +89,10 @@ class FakeLiveClient:
     def get_pending_orders(self, inst_id=""):
         return []
 
+    def get_instrument(self, inst_id):
+        # 巡检补记 trades 行时需要合约面值
+        return {"instId": inst_id, "ctVal": 0.1}
+
     def get_pending_stop_losses(self, inst_id=""):
         return self._sl_results.pop(0) if self._sl_results else []
 

@@ -411,8 +411,9 @@ class TradingLoop:
 
     def _patrol_positions(self, snap, rw):
         """开轮对账（只有会真实下单的环境才动账）：
-        1. 工作单生命周期（未成交报价留盘口覆盖整轮，超龄撤换）；
-        2. 清理已平仓元数据；3. 撤孤儿挂单；4. 补挂缺失保护单；5. 盘中成交补记。"""
+        0. 清理已平仓元数据；1. 盘中成交补记（工作单等待期外/重启间隙
+        成交 → 补 trades 行）；2. 工作单生命周期（超龄撤换、撤残余）；
+        3. 撤孤儿挂单；4. 补挂缺失保护单。"""
         meta = self.risk.state.get_positions_meta()
         working = self.risk.state.get_working_orders()
         live = {p["instId"]: p for p in snap["positions"]}
@@ -430,6 +431,48 @@ class TradingLoop:
                 self.risk.state.set_positions_meta(meta)
                 self.risk.state.set_working_orders(working)
             return
+
+        # ── 盘中成交/重启间隙成交补记（必须在撤残余之前）──
+        # 交易所有仓位但本地没有 trades 行：工作单在等待期外成交、或成交
+        # 瞬间进程重启，会漏掉 _execute_open 的即时成交记账。这里统一补：
+        # 建 trades 行 + 入场单回填 filled + 已有保护单挂到 trade。
+        # 先于工作单生命周期跑，才能从工作单名册取到 stop/analyst。
+        for inst_id, p in live.items():
+            m = meta.get(inst_id) or {}
+            if m.get("trade_pk"):
+                continue
+            wo = working.get(inst_id)
+            sized = {"instId": inst_id, "direction": p["direction"],
+                     "stop_loss": m.get("stop") or (wo or {}).get("stop"),
+                     "target": m.get("target") or (wo or {}).get("target"),
+                     "rr": None, "risk_usdt": None,
+                     "analyst": (wo or {}).get("analyst") or m.get("analyst"),
+                     "committee_score": m.get("committee_score")}
+            pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"])
+            m["trade_pk"] = pk
+            meta[inst_id] = m
+            if wo:
+                w.mark_order_filled(self.store, self.env.name, wo["ord_id"],
+                                    p["contracts"], p["avg_px"], trade_pk=pk)
+            else:
+                # 工作单名册已丢（如上次巡检已 pop）：按交易所侧入场单回填
+                row = self.store.query_one(
+                    "SELECT exch_ord_id FROM orders WHERE env=? AND inst_id=? "
+                    "AND kind='entry' AND state='live' ORDER BY id DESC LIMIT 1",
+                    (self.env.name, inst_id))
+                if row and row["exch_ord_id"]:
+                    w.mark_order_filled(self.store, self.env.name,
+                                        row["exch_ord_id"], p["contracts"],
+                                        p["avg_px"], trade_pk=pk)
+            if m.get("algo_id"):
+                w.link_protect_to_trade(self.store, self.env.name,
+                                        m["algo_id"], pk)
+            changed = True
+            self.log.info("巡检：%s 仓位存在但无 trades 行，已补记（pk=%s）",
+                          inst_id, pk)
+        if changed:
+            self.risk.state.set_positions_meta(meta)
+            self.risk.state.set_working_orders(working)
 
         # ── 工作单生命周期 ──
         now = time.time()
@@ -467,27 +510,6 @@ class TradingLoop:
                 except Exception as e:  # noqa: BLE001
                     self.log.warning("巡检：撤单失败 %s：%s", o["ordId"][:8], e)
 
-        # 盘中成交：工作单在等待期外成交 → 撤残余 + 补记 trades 行
-        for inst_id, p in live.items():
-            wo = working.get(inst_id)
-            if wo and not (meta.get(inst_id) or {}).get("trade_pk"):
-                try:
-                    self.client.cancel_order(inst_id, wo["ord_id"])
-                except Exception:  # noqa: BLE001
-                    pass
-                m = meta.get(inst_id) or {}
-                sized = {"instId": inst_id, "direction": p["direction"],
-                         "stop_loss": m.get("stop"), "target": m.get("target"),
-                         "rr": None, "risk_usdt": m.get("risk_usdt"),
-                         "analyst": m.get("analyst"),
-                         "committee_score": m.get("committee_score")}
-                pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"])
-                m["trade_pk"] = pk
-                meta[inst_id] = m
-                changed = True
-                w.mark_order_filled(self.store, self.env.name, wo["ord_id"],
-                                    p["contracts"], p["avg_px"], trade_pk=pk)
-                self.log.info("巡检：%s 工作单盘中成交，已补记 trades（pk=%s）", inst_id, pk)
         if changed:
             self.risk.state.set_positions_meta(meta)
             self.risk.state.set_working_orders(working)
@@ -528,6 +550,9 @@ class TradingLoop:
                 algo_id = self.client.place_stop_loss(inst_id, p["direction"],
                                                       p["contracts"], stop, tp_px=tp)
                 meta[inst_id] = {**m, "algo_id": algo_id, "stop": stop, "target": tp}
+                if m.get("trade_pk"):  # 补记过 trade 的仓位：保护单挂到同一 trade
+                    w.link_protect_to_trade(self.store, self.env.name,
+                                            str(algo_id), m["trade_pk"])
                 changed = True
                 rw.write_order(self.env.name, inst_id, "protect",
                                "oco" if tp else "conditional",
