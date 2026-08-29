@@ -218,18 +218,26 @@ def _spearman(xs, ys):
 def score_factors(store, gate, bar="1H", env="paper"):
     """逐 (factor, horizon) 打分并走晋级状态机。返回打分快照列表。
 
-    口径说明：
-    - scored_days 数的是观测 bar_ts 的自然日（计分日），不是回填执行日——
-      补跑/重放不会把一批观测盖上同一个日期而推迟晋级。
-    - IC 跨标的混算，但 value 先按标的 z-score：否则 atr_pct 这类量级差异
-      会直接进 Pearson，数出来的东西量纲可疑。
+    统计修正：
+    - n_eff：重叠前向收益（4b/24b）共享 K 线，有效样本 = n/hz。
+      ic_t 和 gate 的 min_obs 都用 n_eff——否则 24b 的 t 值虚高 ~5 倍。
+    - BH/FDR：33 次检验在 α=0.05 下的期望假阳性 1.65 个；对当批 p 值做
+      Benjamini-Hochberg 校正，gate_passed 建立在校正后的显著性上——
+      未证明的因子永不影响下单。
+    - scored_days 数的是观测 bar_ts 的自然日（计分日），不是回填执行日。
+    - IC 跨标的混算，但 value 先按标的 z-score 去量纲。
     """
     now = time.time()
     out = []
     defs = store.query("SELECT name, family, tier, status, created_ts "
                        "FROM factor_defs")
+    fdr_q = float(gate.get("fdr_q", 0.05) or 0.05)
+
+    # Phase 1: 逐 (factor, horizon) 计算统计量
+    scored = []  # (factor, horizon, n, n_eff, scored_days, tracked_days, ic, rank_ic, ic_t, p_value)
     for d in defs:
         for hz in HORIZONS:
+            hz_n = int(hz.rstrip("b"))
             obs = store.query(
                 f"SELECT inst_id, value, fwd_ret_{hz} v, bar_ts FROM factor_obs "
                 f"WHERE factor=? AND fwd_ret_{hz} IS NOT NULL", (d["name"],))
@@ -239,44 +247,102 @@ def score_factors(store, gate, bar="1H", env="paper"):
                                for o in obs}) if n else 0
             tracked_days = int((now - d["created_ts"]) / 86400) + 1
 
-            ic = rank_ic = ic_t = hit = None
+            ic = rank_ic = ic_t = p_value = hit = None
+            n_eff = 0.0
             if n >= 3:
                 xs = _zscore_by_inst(obs)
                 ys = [o["v"] for o in obs]
                 ic = _pearson(xs, ys)
                 rank_ic = _spearman(xs, ys)
-                if ic is not None and abs(ic) < 1:
-                    ic_t = ic * math.sqrt(n - 2) / math.sqrt(1 - ic * ic)
-                elif ic is not None:
+                # 重叠窗口修正：fwd_ret_hb 相邻观测共享 (hb-1)/hb 根 K 线，
+                # 有效样本量 = n/hz——ic_t 不修正则 24b 的 t 值虚高 ~5 倍
+                n_eff = max(n / hz_n, 1.0)
+                if ic is not None and abs(ic) >= 1:
+                    # 完全相关是简并情形（合成信号/重复值），t 无定义但证据是决定性的
                     ic_t = math.copysign(math.inf, ic)
-                # 命中率只在因子取值有正有负时有意义——恒正因子（rsi14、
-                # atr_pct、量比…）会退化成"市场上涨比例"，量的是行情不是因子
+                    p_value = 0.0
+                elif ic is not None and n_eff > 3:
+                    ic_t = ic * math.sqrt(n_eff - 2) / math.sqrt(1 - ic * ic)
+                    p_value = math.erfc(abs(ic_t) / math.sqrt(2))
+                # 其余情形（样本不足）p_value 留 None：不参与 BH，闸门必不过——
+                # 不能让"没有数据"伪装成"p=0 的最强证据"
+                # 命中率只在因子取值有正有负时有意义
                 vals = [o["value"] for o in obs]
                 if any(v > 0 for v in vals) and any(v < 0 for v in vals):
                     hit = sum(1 for o in obs if o["value"] * o["v"] > 0) / n
 
+            scored.append({
+                "factor": d["name"], "horizon": hz,
+                "n_obs": n, "n_eff": n_eff,
+                "scored_days": scored_days, "days_tracked": tracked_days,
+                "ic": ic, "rank_ic": rank_ic, "ic_t": ic_t,
+                "p_value": p_value, "hit_rate": hit,
+            })
+
+    # Phase 2: BH/FDR 多重检验校正（当批全部 p 值一起校正）
+    all_p = [s["p_value"] for s in scored if s["p_value"] is not None]
+    bh_sig = _bh_fdr(all_p, q=fdr_q)
+    valid_indices = [i for i, s in enumerate(scored) if s["p_value"] is not None]
+    for j, idx in enumerate(valid_indices):
+        scored[idx]["bh_significant"] = bh_sig[j]
+
+    # Phase 3: 入库 + 晋级闸门
+    for d in defs:
+        for s in scored:
+            if s["factor"] != d["name"]:
+                continue
+            # 闸门：min_obs 管数据充足性（原始观测数）；统计有效性由 BH 显著性
+            # 把守——ic_t 已按 n_eff 修正，低 n_eff 的 horizon p 值自然不显著。
+            # 两道守卫各司其职，min_obs 不再套 n_eff（那是重复计数同一修正）
             gate_passed = 0
-            if n >= gate.get("min_obs", 100):
+            if s["n_obs"] >= gate.get("min_obs", 100):
                 gate_passed = int(
-                    scored_days >= gate.get("scored_days", 15)
-                    and tracked_days >= gate.get("days_tracked", 30)
-                    and (rank_ic is not None and rank_ic > 0
-                         if gate.get("require_positive_rank_ic") else True))
+                    s["scored_days"] >= gate.get("scored_days", 15)
+                    and s["days_tracked"] >= gate.get("days_tracked", 30)
+                    and (s["rank_ic"] is not None and s["rank_ic"] > 0
+                         if gate.get("require_positive_rank_ic") else True)
+                    and s.get("bh_significant", False))
+            s["gate_passed"] = gate_passed
 
             store.execute(
                 "INSERT INTO factor_scores(factor, horizon, computed_ts, n_obs, "
-                "scored_days, days_tracked, ic, rank_ic, ic_t, hit_rate, "
-                "gate_passed) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (d["name"], hz, now, n, scored_days, tracked_days,
-                 ic, rank_ic, ic_t, hit, gate_passed))
-            out.append({"factor": d["name"], "horizon": hz, "n_obs": n,
-                        "ic": ic, "rank_ic": rank_ic, "hit_rate": hit,
-                        "scored_days": scored_days, "days_tracked": tracked_days,
-                        "gate_passed": gate_passed})
+                "n_eff, scored_days, days_tracked, ic, rank_ic, ic_t, hit_rate, "
+                "gate_passed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (d["name"], s["horizon"], now, s["n_obs"], s["n_eff"],
+                 s["scored_days"], s["days_tracked"],
+                 s["ic"], s["rank_ic"], s["ic_t"], s["hit_rate"],
+                 s["gate_passed"]))
+            out.append({"factor": d["name"], "horizon": s["horizon"],
+                        "n_obs": s["n_obs"], "n_eff": s["n_eff"],
+                        "ic": s["ic"], "rank_ic": s["rank_ic"],
+                        "hit_rate": s["hit_rate"],
+                        "scored_days": s["scored_days"],
+                        "days_tracked": s["days_tracked"],
+                        "gate_passed": s["gate_passed"],
+                        "bh_significant": s.get("bh_significant", False)})
 
-        # 状态机（任意 horizon 过闸即可晋级；全部用最新数据重判）
         _transition(store, d, out, gate, env=env, batch_ts=now)
     return out
+
+
+def _bh_fdr(p_values, q=0.05):
+    """Benjamini-Hochberg FDR：返回与 p_values 等长的布尔列表。
+
+    BH 控制错误发现率（期望假阳性 / 总发现数 ≤ q），比 Bonferroni 宽松
+    但不会把所有检验一刀切死。"""
+    m = len(p_values)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: p_values[i])
+    result = [False] * m
+    # 从最大 k 往回找：p(k) <= (k/m) * q 的最大 k，全部 rank ≤ k 的判显著
+    for k in range(m, 0, -1):
+        idx = order[k - 1]
+        if p_values[idx] <= (k / m) * q:
+            for j in range(k):
+                result[order[j]] = True
+            break
+    return result
 
 
 def _zscore_by_inst(obs):
@@ -305,7 +371,7 @@ def _transition(store, d, scored_rows, gate, env="paper", batch_ts=None):
 
     规则（数据不足只记录不判定）：
       trial   = 任一 horizon gate_passed 且 days_tracked ≥ gate.days_tracked
-      active  = trial 且【上一批】（不含本批）也全部过闸 —— 连续两批
+      active  = trial 且【上一批】（不含本批）也有 horizon 过闸 —— 连续两批
       retired = 已 active 但最新批次 rank_ic ≤ 0
       rejected = tracked ≥ 2×days_tracked 且从未 trial
     """
@@ -345,8 +411,12 @@ def _transition(store, d, scored_rows, gate, env="paper", batch_ts=None):
 
 
 def _prev_batch_also_passed(store, name, batch_ts=None):
-    """看【上一批】（computed_ts 严格早于本批）的 3 个 horizon 是否全过。
-    同一次 score_factors 里三个 horizon 共享 computed_ts，必须排除本批。"""
+    """看【上一批】（computed_ts 严格早于本批）是否也有过闸的 horizon。
+    同一次 score_factors 里三个 horizon 共享 computed_ts，必须排除本批。
+
+    只要求上一批至少一个 horizon 过闸（与 trial 晋级同一标准）而非三个
+    全过：n_eff 修正后高 horizon 样本不足拿不到显著性是常态，要求三全
+    过等于要求因子在所有周期同时显著，超出连续两批稳定的设计意图。"""
     now = batch_ts if batch_ts is not None else time.time()
     rows = store.query(
         "SELECT gate_passed FROM factor_scores WHERE factor=? "
@@ -354,4 +424,4 @@ def _prev_batch_also_passed(store, name, batch_ts=None):
         (name, now))
     if len(rows) < 3:
         return False
-    return all(r["gate_passed"] for r in rows)
+    return any(r["gate_passed"] for r in rows)

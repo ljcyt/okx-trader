@@ -74,6 +74,7 @@ _DEFAULTS = {
     "MAX_OPEN_POSITIONS": 3,
     "MAX_DRAWDOWN": 0.10,
     "SAME_DIRECTION_RISK_CAP": 0.02,
+    "FDR_Q_LEVEL": 0.05,             # BH/FDR 多重检验校正的 q 阈值
     "REGIME_MISMATCH_PENALTY": 1.0,
     "KELLY_ENABLED": False,           # 影子模式：kelly_mult 照算照入库，不改仓位
     "KELLY_FRACTION": 0.5,            # 分数 Kelly（半 Kelly）

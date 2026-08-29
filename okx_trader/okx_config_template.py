@@ -73,6 +73,7 @@ PAPER_EQUITY = 10000.0        # 纸面模式（无 Key）使用的虚拟权益
 SCORE_THRESHOLD = 6.5         # Judge 平均分 ≥ 此值 且 多数通过，提案才胜出
 
 # 因子晋级闸门（照抄 trader.gaagent.ai；未晋级因子只观测、永不影响下单）
+FDR_Q_LEVEL = 0.05           # BH/FDR 多重检验校正 q 阈值
 FACTOR_GATE = {"scored_days": 15, "days_tracked": 30,
                "require_positive_rank_ic": True, "min_obs": 100}         # Judge 平均分 ≥ 此值 且 多数通过，提案才胜出
 LOOP_INTERVAL_SEC = 3600      # 交易循环每轮间隔（秒）—— 建议≈K线周期（1H）

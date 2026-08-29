@@ -196,11 +196,12 @@ CREATE TABLE IF NOT EXISTS factor_scores (
   horizon      TEXT NOT NULL,        -- '1b'|'4b'|'24b'
   computed_ts  REAL NOT NULL,
   n_obs        INTEGER NOT NULL,     -- 参与计算的观测数
+  n_eff        REAL,                 -- 重叠修正后的有效样本量
   scored_days  INTEGER NOT NULL,     -- 有前向收益的自然日数
   days_tracked INTEGER NOT NULL,     -- 从 created_ts 起的自然日数
   ic           REAL,                 -- Pearson(value, fwd_ret)
   rank_ic      REAL,                 -- Spearman
-  ic_t         REAL,                 -- ic * sqrt(n_obs - 2) / sqrt(1 - ic^2)
+  ic_t         REAL,                 -- ic * sqrt(n_eff - 2) / sqrt(1 - ic^2)
   hit_rate     REAL,                 -- sign(value)==sign(fwd_ret) 的占比
   gate_passed  INTEGER NOT NULL DEFAULT 0
 );
