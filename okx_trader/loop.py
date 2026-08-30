@@ -409,6 +409,19 @@ class TradingLoop:
 
     # ────────────────────────── 持仓巡检 / 崩溃对账 ──────────────────────────
 
+    def _approved_plan_for(self, inst_id):
+        """恢复该标的最近一次【获批】的开仓计划（补记/补挂保护单用）。
+
+        trades 的计划字段（stop/target/rr/risk_usdt）以风控批准值为权威：
+        R8 聚合、R 倍数分母都依赖它；交易所实际触发价在 orders.sl_trigger_px，
+        两处各司其职。经 orders.round_pk 关联裁决，避免跨轮误取。"""
+        row = self.store.query_one(
+            "SELECT v.stop_loss, v.target, v.rr, v.risk_usdt "
+            "FROM risk_verdicts v JOIN orders o ON o.round_pk = v.round_pk "
+            "WHERE v.passed=1 AND v.inst_id=? AND o.kind='entry' "
+            "ORDER BY o.id DESC LIMIT 1", (inst_id,))
+        return dict(row) if row else {}
+
     def _patrol_positions(self, snap, rw):
         """开轮对账（只有会真实下单的环境才动账）：
         0. 清理已平仓元数据；1. 盘中成交补记（工作单等待期外/重启间隙
@@ -555,6 +568,13 @@ class TradingLoop:
                     self.log.warning("巡检：%s 对账 algoId=%s 失败（%s），按缺失处理",
                                      inst_id, recorded_algo, e)
             stop = m.get("stop")
+            tp = m.get("target")
+            if not stop or not tp:
+                # meta 缺计划字段（如重启间隙成交后由 ATR 兜底挂过单）：
+                # 从风控裁决恢复——尤其 target，丢了它止盈就永远挂不上
+                plan = self._approved_plan_for(inst_id)
+                stop = stop or plan.get("stop_loss")
+                tp = tp or plan.get("target")
             if not stop:
                 atr = ((snap.get("factors") or {}).get(inst_id) or {}).get("atr")
                 if not atr:
@@ -565,7 +585,6 @@ class TradingLoop:
                     continue
                 stop = (p["avg_px"] - 1.5 * atr if p["direction"] == "long"
                         else p["avg_px"] + 1.5 * atr)
-            tp = m.get("target")
             try:
                 algo_id = self.client.place_stop_loss(inst_id, p["direction"],
                                                       p["contracts"], stop, tp_px=tp)
@@ -762,11 +781,25 @@ class TradingLoop:
 
     # ────────────────────────── 循环 ──────────────────────────
 
+    def _close_interrupted_rounds(self):
+        """启动收尾：上次进程中断遗留的 running/working 轮次标为 error。
+        不做这步，每次重启都会新增一条僵尸轮次。"""
+        n = self.store.query_one(
+            "SELECT COUNT(*) c FROM rounds WHERE status IN ('running','working')")["c"]
+        if n:
+            self.store.execute(
+                "UPDATE rounds SET status='error', "
+                "error='进程重启中断（启动收尾）' "
+                "WHERE status IN ('running','working')")
+            self.log.info("启动收尾：%d 条中断轮次已标记为 error", n)
+        return n
+
     def run(self, interval_sec=None, max_rounds=None, on_round=None):
         """双层调度：cognition round（默认 1h）+ 机械 risk tick（默认 5min），
         同线程串行；撞点时 round 先跑（它开头本来就含一次巡检，不重复）。"""
         interval = interval_sec or getattr(self.cfg, "LOOP_INTERVAL_SEC", 3600)
         tick_sec = int(getattr(self.cfg, "RISK_TICK_SEC", 300) or 0)
+        self._close_interrupted_rounds()
         self.log.info("交易循环启动：round 每 %ds，tick 每 %ds，env=%s executing=%s",
                       interval, tick_sec, self.env.name, self.executing)
         next_round_at = time.time()      # 立即跑第一轮

@@ -233,6 +233,52 @@ class PatrolBackfillTest(unittest.TestCase):
         meta = loop.risk.state.get_positions_meta()[INST]
         self.assertEqual(meta["trade_pk"], rows[0]["id"])  # meta 已接回
 
+    def test_backfill_recovers_plan_from_risk_verdict(self):
+        """重启间隙成交：trades 的计划字段从风控裁决恢复——R8 同向聚合
+        （SUM(risk_usdt)）与 R 倍数分母都依赖它，不能因补记而断线。"""
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        rw1, entry, ord_id = self._place_working(loop)
+        self._fill_on_exchange(loop, ord_id)
+        loop.risk.state.set_working_orders({})
+        loop.store.execute(
+            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
+            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
+            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rw1.pk, 1, "OK", "[]", "[]", INST, 103.56, 107.825, 1.77, 969.61))
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        tr = dict(loop.store.query_one("SELECT * FROM trades"))
+        self.assertEqual(tr["status"], "open")
+        self.assertAlmostEqual(tr["risk_usdt"], 969.61, places=6)
+        self.assertAlmostEqual(tr["target_px"], 107.825, places=6)
+        self.assertAlmostEqual(tr["stop_px"], 103.56, places=6)      # 批准值
+        self.assertAlmostEqual(tr["planned_rr"], 1.77, places=6)
+
+    def test_protect_reattach_recovers_target_from_verdict(self):
+        """meta 全丢时补挂保护单：target 从风控裁决恢复 → 挂 OCO 而非
+        纯止损（否则"因 RR≥1.5 批准"和"挂出能实现 RR 的单"断开）。"""
+        tmp = tempfile.mkdtemp(prefix="okxpb-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        rw1, entry, ord_id = self._place_working(loop)
+        self._fill_on_exchange(loop, ord_id)
+        loop.risk.state.set_working_orders({})
+        loop.risk.state.set_positions_meta({})
+        loop.store.execute(
+            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
+            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
+            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rw1.pk, 1, "OK", "[]", "[]", INST, 103.56, 107.825, 1.77, 969.61))
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        protect = loop.store.query_one("SELECT * FROM orders WHERE kind='protect'")
+        self.assertIsNotNone(protect)
+        self.assertAlmostEqual(protect["sl_trigger_px"], 103.56, places=6)
+        self.assertAlmostEqual(protect["tp_trigger_px"], 107.825, places=6)
+        meta = loop.risk.state.get_positions_meta()[INST]
+        self.assertEqual(meta["trade_pk"],
+                         loop.store.query_one("SELECT id FROM trades")["id"])
+
     def test_fill_backfill_links_existing_protect(self):
         """保护单先于补记存在（止损先挂上、trade 后补）→ 挂链到同一 trade。"""
         tmp = tempfile.mkdtemp(prefix="okxpb-")

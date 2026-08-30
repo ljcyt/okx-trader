@@ -122,6 +122,23 @@ class DrawdownLadderTest(unittest.TestCase):
             "SELECT COUNT(*) c FROM equity_curve WHERE round_pk IS NULL")["c"]
         self.assertEqual(n, 1)
 
+    def test_startup_marks_interrupted_rounds(self):
+        """启动收尾：running/working 遗留轮次标 error——不做这步每次
+        重启都会新增一条僵尸轮次。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8e-"))
+        for st in ("running", "working", "no_action"):
+            loop.store.execute(
+                "INSERT INTO rounds(round_id, ts, env, executing, llm_mode, "
+                "status) VALUES (?,?,?,?,?,?)",
+                (f"r-{st}", 1000.0, "replay", 0, "baseline", st))
+        n = loop._close_interrupted_rounds()
+        self.assertEqual(n, 2)                    # no_action 不动
+        rows = {r["round_id"]: r["status"] for r in
+                loop.store.query("SELECT round_id, status FROM rounds")}
+        self.assertEqual(rows["r-running"], "error")
+        self.assertEqual(rows["r-working"], "error")
+        self.assertEqual(rows["r-no_action"], "no_action")
+
     def test_tick_refreshes_last_snapshot_pnl(self):
         """面板读 last_snapshot——tick 必须把新鲜权益/持仓刷进去，
         否则两轮之间（最长 1 小时）面板显示冻结旧数（实测曾虚报 170 U）。"""
