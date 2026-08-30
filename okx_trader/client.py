@@ -310,9 +310,18 @@ class OKXClient:
                               self.public.funding_rate_history,
                               inst_id, limit=str(limit))
             rows = list(reversed(resp.get("data", [])))
-            return [{"ts": int(r[0]), "rate": float(r[1])} for r in rows]
+            out = []
+            for r in rows:
+                # 该端点在 python-okx 0.4.3 返回 dict 行（fundingTime/
+                # fundingRate），其余行情端点返回数组——两种都兼容
+                if isinstance(r, dict):
+                    out.append({"ts": int(r.get("fundingTime") or 0),
+                                "rate": float(r.get("fundingRate") or 0)})
+                else:
+                    out.append({"ts": int(r[0]), "rate": float(r[1])})
+            return out
         except Exception as e:  # noqa: BLE001
-            self.log.debug("资金费率历史获取失败：%s", e)
+            self.log.warning("资金费率历史获取失败：%s", e)
             return None
 
     def get_funding_rate(self, inst_id):

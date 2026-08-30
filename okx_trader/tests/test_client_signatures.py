@@ -139,6 +139,19 @@ class ClientSignatureTest(unittest.TestCase):
                 failures.append(trap.error)
         self.assertEqual(failures, [])
 
+    def test_funding_history_parses_dict_rows(self):
+        """python-okx 0.4.3 的 funding_rate_history 返回 dict 行（fundingTime/
+        fundingRate），其余行情端点返回数组——曾按数组解析导致 KeyError 被
+        except 吞掉，funding_rank 整条链路瞎掉。"""
+        self.cl.public.funding_rate_history = lambda *a, **k: {
+            "code": "0", "data": [
+                {"fundingTime": "1788076800000", "fundingRate": "0.00008"},
+                {"fundingTime": "1788048000000", "fundingRate": "0.00004"}]}
+        rows = self.cl.get_funding_history("BTC-USDT-SWAP")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["ts"], 1788048000000)   # 升序：已 reverse
+        self.assertAlmostEqual(rows[0]["rate"], 0.00004, places=9)
+
     def test_trap_actually_catches_bad_kwargs(self):
         """自证有效性：故意传一个不存在的关键字，trap 必须报错。"""
         real = self.cl.account.set_leverage
