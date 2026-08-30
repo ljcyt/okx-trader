@@ -467,6 +467,13 @@ class TradingLoop:
                 changed = True
                 continue
             plan = self._approved_plan_for(inst_id)
+            # 审计链：trades.open_round_pk 指向批准这笔交易的轮次
+            #（入场单所属 round），不是当前巡检轮——否则面板追溯断裂
+            ord_row = self.store.query_one(
+                "SELECT round_pk FROM orders WHERE env=? AND inst_id=? "
+                "AND kind='entry' ORDER BY id DESC LIMIT 1",
+                (self.env.name, inst_id))
+            open_round_pk = (ord_row["round_pk"] if ord_row else None)
             sized = {"instId": inst_id, "direction": p["direction"],
                      "stop_loss": plan.get("stop_loss") or m.get("stop")
                      or (wo or {}).get("stop"),
@@ -481,7 +488,11 @@ class TradingLoop:
                               "stop=%s, target=%s）", inst_id,
                               plan.get("risk_usdt") or 0,
                               plan.get("stop_loss"), plan.get("target"))
-            pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"])
+            pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"],
+                                open_round_pk=open_round_pk)
+            if open_round_pk is not None and open_round_pk != rw.pk:
+                self.log.info("巡检：%s trades 行审计链指向批准轮 #%s"
+                              "（当前巡检轮 #%s）", inst_id, open_round_pk, rw.pk)
             m["trade_pk"] = pk
             meta[inst_id] = m
             if wo:

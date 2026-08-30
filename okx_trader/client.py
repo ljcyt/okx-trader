@@ -303,8 +303,11 @@ class OKXClient:
     def get_funding_history(self, inst_id, limit=90):
         """资金费率历史（升序），用于计算当前费率的滚动分位。"""
         try:
+            # python-okx PublicAPI 的方法名是 funding_rate_history（无 get_
+            # 前缀）——曾经写成 get_funding_rate_history，AttributeError 被
+            # 这里的 except 吞掉后静默返回 None，funding_rank 整条瞎掉
             resp = self._call("funding_rate_history",
-                              self.public.get_funding_rate_history,
+                              self.public.funding_rate_history,
                               inst_id, limit=str(limit))
             rows = list(reversed(resp.get("data", [])))
             return [{"ts": int(r[0]), "rate": float(r[1])} for r in rows]

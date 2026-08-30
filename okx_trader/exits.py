@@ -31,7 +31,7 @@ def _open_trades_by_inst(store):
 
 
 def manage_open_positions(loop, snap, rw):
-    """移动止损 + 时间止损。只在会真实下单的环境跑（paper/replay 无真实仓位）。"""
+    """移动止损 + 时间止损 + regime 逆转收紧。只在会真实下单的环境跑。"""
     if not loop.executing:
         return
     client = loop.client
@@ -39,6 +39,10 @@ def manage_open_positions(loop, snap, rw):
     meta_all = loop.risk.state.get_positions_meta()
     open_trades = _open_trades_by_inst(loop.store)
     changed_meta = False
+    regime_row = loop.store.query_one(
+        "SELECT regime FROM rounds WHERE regime IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1")
+    last_regime = regime_row["regime"] if regime_row else None
 
     for p in snap["positions"]:
         inst = p["instId"]
@@ -103,6 +107,66 @@ def manage_open_positions(loop, snap, rw):
                 except Exception as e:  # noqa: BLE001
                     loop.log.error("移动止损失败 %s：%s（保留原止损 %.4g）",
                                    inst, e, current_stop)
+
+        # ── regime 逆转收紧：市况翻转逆向后一次性收紧止损 ──
+        # regime 门控原本只在入场时生效，持仓期间翻转（long 遇 trending_down）
+        # 无人处理。翻转 → 止损收到保本（浮盈≥0）或止损-入场中点（浮亏，
+        # 且保持距现价 ≥0.1R 防即时触发）。meta 记录已处置的 regime，
+        # 同一段逆向市况只收一次，防每 tick 连续推进。
+        adverse = ((direction == "long" and last_regime == "trending_down")
+                   or (direction == "short" and last_regime == "trending_up"))
+        # r_now ≥1 交给上面的 trailing（保本+跟随已更优），避免两规则
+        # 各持一份 current_stop 互相倒退
+        if adverse and r_now < 1.0 and m.get("regime_gate") != last_regime:
+            tick_sz = client.get_instrument(inst)["tickSz"]
+            if r_now >= 0:
+                desired = max(current_stop, entry)
+            else:
+                desired = min((current_stop + entry) / 2.0, mark - 0.1 * r_price)
+            desired = client.round_price(desired, tick_sz)
+            improved = desired > current_stop if direction == "long" \
+                else desired < current_stop
+            if improved:
+                old_algo = m.get("algo_id")
+                if old_algo:
+                    try:
+                        client.cancel_stop_loss(inst, old_algo)
+                    except Exception:  # noqa: BLE001 —— 可能已触发
+                        pass
+                try:
+                    algo_id = client.place_stop_loss(
+                        inst, direction, p["contracts"], desired,
+                        tp_px=m.get("target"))
+                    meta_all[inst] = {**m, "algo_id": algo_id, "stop": desired,
+                                      "regime_gate": last_regime}
+                    changed_meta = True
+                    if tr:
+                        loop.store.execute("UPDATE trades SET stop_px=? WHERE id=?",
+                                           (desired, tr["id"]))
+                    rw.write_order(loop.env.name, inst, "protect",
+                                   "oco" if m.get("target") else "conditional",
+                                   exch_algo_id=str(algo_id),
+                                   side="sell" if direction == "long" else "buy",
+                                   sz=p["contracts"], sl_trigger_px=desired,
+                                   tp_trigger_px=m.get("target"), state="live",
+                                   note=f"regime 逆转收紧 "
+                                        f"{current_stop:.4g}→{desired:.4g}")
+                    w.write_event(loop.store, loop.env.name, "regime_gate",
+                                  f"{inst} {direction} 遇 {last_regime}"
+                                  f"——止损收紧 {current_stop:.4g}→{desired:.4g}",
+                                  level="warn", inst_id=inst, round_pk=rw.pk)
+                    loop.log.warning("regime 逆转：%s %s 遇 %s，止损 %.4g→%.4g",
+                                     inst, direction, last_regime,
+                                     current_stop, desired)
+                except Exception as e:  # noqa: BLE001
+                    loop.log.error("regime 收紧失败 %s：%s（保留原止损）", inst, e)
+            else:
+                # 收不出更好的价（如深亏到中点仍在现价下方不到 0.1R）——
+                # 记录已处置，交给原止损，不反复尝试
+                meta_all[inst] = {**m, "regime_gate": last_regime}
+                changed_meta = True
+                loop.log.info("regime 逆转：%s 遇 %s，无可收紧空间（%.2fR）",
+                              inst, last_regime, r_now)
 
         # ── 时间止损 ──
         opened_ts = (tr["opened_ts"] if tr else None) or _parse_ts(m.get("opened_at"))
@@ -192,15 +256,21 @@ def _parse_ts(s):
         return None
 
 
-def open_trade_row(loop, rw, sized, filled, avg_px):
-    """成交即建 trades 行（status='open'）。返回 trade_pk。"""
+def open_trade_row(loop, rw, sized, filled, avg_px, open_round_pk=None):
+    """成交即建 trades 行（status='open'）。返回 trade_pk。
+
+    open_round_pk：批准这笔交易的轮次。补记路径必须传入入场单所属的
+    round_pk（orders.round_pk）——默认用当前巡检轮会把审计链指到
+    一个 no_action 轮次上，面板的"决策 → 结果"追溯就断了。"""
     inst = sized["instId"]
     ct = loop.client.get_instrument(inst)["ctVal"]
     return loop.store.execute(
         "INSERT INTO trades(env, inst_id, direction, open_round_pk, opened_ts, "
         "contracts, ct_val, entry_px, stop_px, target_px, planned_rr, risk_usdt, "
         "analyst, committee_score, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open')",
-        (loop.env.name, inst, sized["direction"], rw.pk, time.time(),
+        (loop.env.name, inst, sized["direction"],
+         open_round_pk if open_round_pk is not None else rw.pk,
+         time.time(),
          filled, ct, avg_px, sized.get("stop_loss"), sized.get("target"),
          sized.get("rr"), sized.get("risk_usdt"), sized.get("analyst"),
          sized.get("committee_score")))

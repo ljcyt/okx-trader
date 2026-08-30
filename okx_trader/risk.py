@@ -324,6 +324,19 @@ class RiskManager:
                     v.sized["target_source"] = target_source
                     v.sized["rr"] = round(rr, 2)
                     v.warn(f"盈亏比 RR={rr:.2f}（目标 {target:.4g}，来源 {target_source}）")
+                    # 双口径显式化：最近结构位（不过滤贴脸位）的 RR 单独报——
+                    # 批准 RR 依赖"跳过近位取远位"的取舍，裁判与审计都看得到，
+                    # 而不是软硬两层各算各的（资管裁判曾按最近位算出 0.33 并
+                    # 四次正确提示同向叠加，而 R7 按 107.825 批出 1.77）
+                    if levels:
+                        rr_nearest = abs(levels[0] - entry_ref) / stop_dist
+                        if rr_nearest < self.cfg.MIN_RR:
+                            v.warn(
+                                f"最近结构位 {levels[0]:.4g} 的 RR 仅 "
+                                f"{rr_nearest:.2f}（< {self.cfg.MIN_RR}，"
+                                f"距入场 {abs(levels[0] - entry_ref):.4g}）——"
+                                f"批准依赖更远目标，价格可能先在近位受阻"
+                            )
 
         self.log.info(
             "风控审查 %s %s：%s（%.0fms）",

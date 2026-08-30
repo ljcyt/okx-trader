@@ -254,6 +254,8 @@ class PatrolBackfillTest(unittest.TestCase):
         self.assertAlmostEqual(tr["target_px"], 107.825, places=6)
         self.assertAlmostEqual(tr["stop_px"], 103.56, places=6)      # 批准值
         self.assertAlmostEqual(tr["planned_rr"], 1.77, places=6)
+        # 审计链：open_round_pk 指向批准轮（入场单所属），不是巡检轮
+        self.assertEqual(tr["open_round_pk"], rw1.pk)
 
     def test_protect_reattach_recovers_target_from_verdict(self):
         """meta 全丢时补挂保护单：target 从风控裁决恢复 → 挂 OCO 而非

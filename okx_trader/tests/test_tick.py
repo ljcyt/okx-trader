@@ -122,6 +122,44 @@ class DrawdownLadderTest(unittest.TestCase):
             "SELECT COUNT(*) c FROM equity_curve WHERE round_pk IS NULL")["c"]
         self.assertEqual(n, 1)
 
+    def test_regime_flip_tightens_stop_once(self):
+        """持仓期间 regime 翻转逆向 → 止损一次性收到中点（滞回：同段
+        市况只收一次）。评审发现：regime 只在入场时判，从不复查持仓。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8f-"),
+                         script=[{"price": 100.0}])
+        loop.client._open("SOL-USDT-SWAP", "buy", 100.0, 105.0)
+        loop.risk.state.set_positions_meta({"SOL-USDT-SWAP": {
+            "direction": "long", "stop": 103.0, "contracts": 100.0}})
+        loop.store.execute(
+            "INSERT INTO rounds(round_id, ts, env, executing, llm_mode, "
+            "status, regime) VALUES ('r1', 1000.0, 'replay', 0, 'baseline', "
+            "'no_action', 'trending_down')")
+        rw = type("RW", (), {"pk": None,
+                             "write_order": lambda *a, **k: None})()
+        # 手工 snap：mark 104.2 → 浮亏 −0.4R（replay 仓位无 mark_px）
+        snap = {"positions": [{"instId": "SOL-USDT-SWAP", "direction": "long",
+                               "contracts": 100.0, "avg_px": 105.0,
+                               "mark_px": 104.2}],
+                "factors": {"SOL-USDT-SWAP": {"atr": 1.0}}}
+
+        from okx_trader.exits import manage_open_positions
+        manage_open_positions(loop, snap, rw)
+        meta = loop.risk.state.get_positions_meta()["SOL-USDT-SWAP"]
+        # 中点：(103 + 105)/2 = 104；距现价 100 有 4 > 0.1R(0.2) → 可收
+        self.assertAlmostEqual(meta["stop"], 104.0, places=6)
+        self.assertEqual(meta["regime_gate"], "trending_down")
+        n_ev = loop.store.query_one(
+            "SELECT COUNT(*) c FROM app_events WHERE kind='regime_gate'")["c"]
+        self.assertEqual(n_ev, 1)
+
+        # 同段市况第二次 tick：不再连续收紧（滞回）
+        manage_open_positions(loop, snap, rw)
+        meta = loop.risk.state.get_positions_meta()["SOL-USDT-SWAP"]
+        self.assertAlmostEqual(meta["stop"], 104.0, places=6)
+        n_ev = loop.store.query_one(
+            "SELECT COUNT(*) c FROM app_events WHERE kind='regime_gate'")["c"]
+        self.assertEqual(n_ev, 1)
+
     def test_startup_marks_interrupted_rounds(self):
         """启动收尾：running/working 遗留轮次标 error——不做这步每次
         重启都会新增一条僵尸轮次。"""
