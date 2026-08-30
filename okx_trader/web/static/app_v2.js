@@ -109,8 +109,8 @@ async function renderOverview() {
   const pos = state.positions || [];
   if (!pos.length) html += `<div class="muted">空仓中——委员会没找到值得出手的机会，等着就好</div>`;
   else {
-    html += `<table><thead><tr><th>标的</th><th>方向</th><th>数量</th><th>买入价</th>
-      <th>现价</th><th>浮动盈亏</th></tr></thead><tbody>`;
+    html += `<table><thead><tr><th>标的</th><th>方向</th><th class="num">数量</th><th class="num">买入价</th>
+      <th class="num">现价</th><th class="num">浮动盈亏</th></tr></thead><tbody>`;
     for (const p of pos)
       html += `<tr><td>${esc(p.instId)}</td><td>${p.direction === "long" ? "做多" : "做空"}</td>
         <td class="num">${fmt(p.contracts)}</td><td class="num">${fmt(p.avg_px)}</td>
@@ -360,8 +360,8 @@ async function renderTrades() {
   html += `<div class="card"><h3>交易记录（${data.total}）</h3>`;
   if (!data.items.length) html += `<div class="muted">还没有交易——纸面/回放模式不产生真实成交</div>`;
   else {
-    html += `<table><thead><tr><th>开仓时间</th><th>标的</th><th>方向</th><th>买入价</th><th>卖出价</th>
-      <th>盈亏</th><th>结果</th><th>谁提议的</th></tr></thead><tbody>`;
+    html += `<table><thead><tr><th>开仓时间</th><th>标的</th><th>方向</th><th class="num">买入价</th><th class="num">卖出价</th>
+      <th class="num">盈亏</th><th>结果</th><th>谁提议的</th></tr></thead><tbody>`;
     for (const t of data.items)
       html += `<tr onclick="location.hash='#/trades/${t.id}'">
         <td>${ts(t.opened_ts)}</td><td>${esc((t.inst_id || "").replace("-SWAP", ""))}</td>
@@ -374,7 +374,7 @@ async function renderTrades() {
   }
   html += `</div>`;
   for (const [title, bucket] of [["按标的", stats.by_symbol], ["按分析师（哪个人设真的赚钱）", stats.by_analyst]]) {
-    html += `<div class="card"><h3>${title}</h3><table><thead><tr><th>名称</th><th>笔数</th><th>盈亏</th><th>胜率</th></tr></thead><tbody>`;
+    html += `<div class="card"><h3>${title}</h3><table><thead><tr><th>名称</th><th class="num">笔数</th><th class="num">盈亏</th><th class="num">胜率</th></tr></thead><tbody>`;
     const keys = Object.keys(bucket || {});
     if (!keys.length) html += `<tr><td colspan="4" class="muted">暂无已平仓数据</td></tr>`;
     for (const k of keys) {
