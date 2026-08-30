@@ -218,13 +218,10 @@ def create_app(cfg, store, loop=None):
     @app.get("/api/equity")
     def equity():
         args = _query_args("env", "from", "to")
-        sql = "SELECT ts, equity, hwm FROM equity_curve WHERE 1=1"
-        params = []
-        for col, key in (("env", "env"), ("ts", "from"), ("ts", "to")):
-            pass
-        if "env" in args:
-            sql += " AND env=?"
-            params.append(args["env"])
+        # 不传 env 时默认当前环境——paper/demo 混画会出现假跳变
+        env = args.get("env") or (loop.env.name if loop else cfg.TRADING_ENV)
+        sql = "SELECT ts, equity, hwm FROM equity_curve WHERE env=?"
+        params = [env]
         if "from" in args:
             sql += " AND ts>=?"
             params.append(float(args["from"]))
@@ -233,7 +230,8 @@ def create_app(cfg, store, loop=None):
             params.append(float(args["to"]))
         sql += " ORDER BY ts ASC LIMIT 5000"
         rows = store.query(sql, params)
-        return _ok(points=[[row["ts"], row["equity"], row["hwm"]] for row in rows])
+        return _ok(env=env, points=[[row["ts"], row["equity"], row["hwm"]]
+                                    for row in rows])
 
     @app.get("/api/stats")
     def stats():
