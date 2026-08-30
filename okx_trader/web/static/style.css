@@ -59,7 +59,9 @@ footer { text-align: center; color: var(--fg-3); font-size: 12px; padding: 18px;
   text-transform: uppercase; letter-spacing: 0.06em; }
 
 /* ── 关键数字：标签小写灰、数字大而紧 ──────────────────────────── */
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; }
+/* 固定 6/3/2 列阶梯：auto-fit 在不整除时会留孤行，看起来像错位 */
+.tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
 .tile { padding: 13px 16px; }
 .tile .v { font-family: ui-monospace, "JetBrains Mono", Consolas, monospace;
   font-size: 20px; font-weight: 650; letter-spacing: -0.01em;
@@ -146,6 +148,16 @@ a:focus-visible, button:focus-visible { outline: none;
 }
 @media (max-width: 640px) {
   main { padding: 14px 10px 20px; }
-  header { padding: 0 12px; }
   .tile .v { font-size: 18px; }
+  /* 窄屏顶栏：品牌一行，导航收成可横滑的标签条，不再换行散架 */
+  header { flex-wrap: wrap; height: auto; padding: 8px 12px; row-gap: 2px; }
+  nav { width: 100%; flex-wrap: nowrap; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  nav::-webkit-scrollbar { display: none; }
+  nav a, nav button { flex: 0 0 auto; }
+  nav a { padding: 5px 10px; }
+  .tiles { grid-template-columns: repeat(2, 1fr); }
+  /* 表格在窄屏允许换行，不再把卡片顶出横向滚动 */
+  th, td { white-space: normal; }
+  .filters select { max-width: 46%; }
 }
