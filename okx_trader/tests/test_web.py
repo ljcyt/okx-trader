@@ -125,6 +125,27 @@ class WebTest(unittest.TestCase):
         self.assertIn("HttpOnly", cookie)
         self.assertIn("samesite=lax", cookie.lower())
 
+    def test_state_exposes_pnl_summary(self):
+        """"赚了多少"三件套：起始权益 / 累计收益 / 浮动+已实现拆分。"""
+        # 首条权益曲线 = 起始权益 10000；一条已平仓交易 realized_pnl=+50
+        self.store.execute(
+            "INSERT INTO equity_curve(ts, env, equity, hwm, drawdown) "
+            "VALUES (?,?,?,?,0)", (1000.0, "paper", 10000.0, 10000.0))
+        self.store.execute(
+            "INSERT INTO trades(env, inst_id, direction, opened_ts, contracts, "
+            "ct_val, entry_px, status, realized_pnl) VALUES "
+            "('paper','BTC-USDT-SWAP','long',1000.0,1,0.01,50000.0,'closed',50.0)")
+        _, headers, _ = self._login()
+        cookie = get_cookie(headers)
+        status, _, body = call_wsgi(self.app, "GET", "/api/state", cookie=cookie)
+        data = json.loads(body)
+        self.assertTrue(status.startswith("200"), status)
+        a = data["account"]
+        self.assertEqual(a["starting_equity"], 10000.0)
+        self.assertEqual(a["total_return"], 0.0)  # 现权益快照=起始行 → 0
+        self.assertEqual(a["realized_pnl"], 50.0)
+        self.assertEqual(a["total_upl"], 0.0)     # 无持仓快照 → 0
+
     def test_rounds_pagination_and_detail(self):
         _, headers, _ = self._login()
         cookie = get_cookie(headers)

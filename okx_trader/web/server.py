@@ -150,6 +150,7 @@ def create_app(cfg, store, loop=None):
 
     @app.get("/api/state")
     def state():
+        env_name = loop.env.name if loop else cfg.TRADING_ENV
         last = (loop.last_snapshot if loop else None) or _last_equity_row(store)
         drawdown = (last or {}).get("drawdown") or 0
         tripped = bool(drawdown > (cfg.MAX_DRAWDOWN or 1))
@@ -157,6 +158,18 @@ def create_app(cfg, store, loop=None):
         pending = store.query(
             "SELECT * FROM orders WHERE state='live' AND kind='entry' "
             "ORDER BY created_ts DESC LIMIT 20")
+        # "赚了多少"三件套：起始权益（本环境首条权益曲线）、累计收益
+        # （现权益−起始，OKX 权益本身已含浮动）、浮动/已实现拆分
+        start = store.query_one(
+            "SELECT equity FROM equity_curve WHERE env=? ORDER BY ts ASC "
+            "LIMIT 1", (env_name,))
+        starting_equity = start["equity"] if start else None
+        equity = (last or {}).get("equity")
+        total_upl = sum(float(p.get("upl") or 0) for p in positions
+                        if isinstance(p, dict))
+        realized = store.query_one(
+            "SELECT COALESCE(SUM(realized_pnl),0) s FROM trades "
+            "WHERE env=? AND status='closed'", (env_name,))["s"]
         out = {
             "env": loop.env.name if loop else cfg.TRADING_ENV,
             "executing": bool(loop.executing) if loop else False,
@@ -176,10 +189,16 @@ def create_app(cfg, store, loop=None):
                 "last_round_id": getattr(loop, "last_round_id", None),
             },
             "account": {
-                "equity": (last or {}).get("equity"),
+                "equity": equity,
                 "hwm": (last or {}).get("hwm"),
                 "drawdown": drawdown,
                 "usdt_avail": (last or {}).get("usdt_avail"),
+                "starting_equity": starting_equity,
+                "total_return": (equity - starting_equity)
+                                if (equity is not None
+                                    and starting_equity is not None) else None,
+                "total_upl": total_upl,
+                "realized_pnl": realized,
             },
             "positions": positions,
             "pending_orders": [dict(o) for o in pending],

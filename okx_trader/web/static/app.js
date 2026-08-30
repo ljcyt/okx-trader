@@ -66,9 +66,11 @@ async function renderOverview() {
     html += `<div class="healthbar">数据健康：因子 ${lh.symbols_ok}/${lh.symbols_total} ✔</div>`;
   html += `<div class="tiles">
     <div class="card tile"><div class="v">${fmt(a.equity)}</div><div class="k">账户权益 USDT</div></div>
+    <div class="card tile"><div class="v ${a.total_return >= 0 ? "up" : "down"}">${a.total_return == null ? "—" : (a.total_return >= 0 ? "+" : "") + fmt(a.total_return)}</div><div class="k">累计收益（含浮动）</div></div>
+    <div class="card tile"><div class="v ${a.total_upl >= 0 ? "up" : "down"}">${a.total_upl == null ? "—" : (a.total_upl >= 0 ? "+" : "") + fmt(a.total_upl)}</div><div class="k">浮动盈亏（当前持仓）</div></div>
+    <div class="card tile"><div class="v ${a.realized_pnl >= 0 ? "up" : "down"}">${(a.realized_pnl >= 0 ? "+" : "") + fmt(a.realized_pnl || 0)}</div><div class="k">已实现盈亏（已平仓）</div></div>
     <div class="card tile"><div class="v ${a.drawdown > 0 ? "down" : "up"}">${pct(a.drawdown)}</div><div class="k">距高水位回撤</div></div>
     <div class="card tile"><div class="v">${(state.positions || []).length}</div><div class="k">当前持仓</div></div>
-    <div class="card tile"><div class="v">${state.loop.rounds_done}</div><div class="k">本轮进程轮数</div></div>
   </div>`;
   // 回撤档位 + 机械 tick（Phase 8）
   const rung = state.dd_rung || {level: 0, ladder: []};
