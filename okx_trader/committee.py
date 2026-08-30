@@ -441,15 +441,32 @@ class Committee:
         return "\n".join(reversed(lines))
 
     def _analyst_track_record(self):
-        """按人设的累计战绩（与 /api/stats 的 by_analyst 同一查询口径）。"""
+        """按人设的累计战绩（与 /api/stats 的 by_analyst 同一查询口径）。
+
+        最小样本闸门：已平仓样本 < MIN_TRADES_FOR_STATS 时只输出显式声明，
+        不给战绩数字——喂单笔噪声进提示词，LLM 会围绕唯一一笔持仓自我
+        强化。统计口径只算 status='closed' 且 r_multiple IS NOT NULL
+        （缺分母的行进任何胜率/累计 R 都是掺假）。"""
         if self.store is None:
             return ""
+        min_n = int(getattr(self.cfg, "MIN_TRADES_FOR_STATS", 10) or 10)
+        try:
+            total = self.store.query_one(
+                "SELECT COUNT(*) c FROM trades "
+                "WHERE status='closed' AND r_multiple IS NOT NULL")["c"]
+        except Exception:  # noqa: BLE001
+            return ""
+        if total < min_n:
+            return ("  按人设战绩：样本不足"
+                    f"（已平仓 {total} 笔 < {min_n}），"
+                    "本轮不提供历史绩效参考——请勿凭单笔结果推断人设优劣")
         try:
             rows = self.store.query(
                 "SELECT analyst, COUNT(*) n, "
                 "SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) wins, "
                 "SUM(r_multiple) sum_r FROM trades "
-                "WHERE status='closed' AND analyst IS NOT NULL GROUP BY analyst")
+                "WHERE status='closed' AND analyst IS NOT NULL "
+                "AND r_multiple IS NOT NULL GROUP BY analyst")
         except Exception:  # noqa: BLE001
             return ""
         if not rows:

@@ -180,12 +180,25 @@ class DrawdownLadderTest(unittest.TestCase):
     def test_tick_refreshes_last_snapshot_pnl(self):
         """面板读 last_snapshot——tick 必须把新鲜权益/持仓刷进去，
         否则两轮之间（最长 1 小时）面板显示冻结旧数（实测曾虚报 170 U）。"""
-        loop = make_loop(tempfile.mkdtemp(prefix="okxt8d-"))
+        # script 带 price：空 script 的 ticker 兜底价 100 会让孤儿收养
+        # 复核的 R1 误判"计划过期"把仓位平掉
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8d-"),
+                         script=[{"price": 78000.0}])
         loop.last_snapshot = {"equity": 10000.0, "hwm": 10000.0,
                               "drawdown": 0.0, "usdt_avail": 0.0,
                               "positions": []}
         loop.client.equity = 9950.0
         loop.client._open("BTC-USDT-SWAP", "buy", 5.0, 78000.0)  # 新持仓出现
+        # 批准行：tick 巡检发现孤儿仓位时重跑 R1-R8 需要计划字段
+        # （止损 400U 距离 + ATR 目标，RR 达标）。round_pk 需真实存在（FK）
+        from okx_trader.store.write import RoundWriter
+        arw = RoundWriter.open(loop.store, "approved", 1.0, "replay", 0,
+                               "baseline")
+        loop.store.execute(
+            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
+            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
+            "risk_usdt) VALUES (?, 1, 'OK', '[]', '[]', "
+            "'BTC-USDT-SWAP', 77600.0, 79200.0, 4.0, 50.0)", (arw.pk,))
         loop.risk_tick()
         # 权益 = tick 实时采样值（回放客户端会扣持仓名义），绝非旧的 10000
         self.assertEqual(loop.last_snapshot["equity"],

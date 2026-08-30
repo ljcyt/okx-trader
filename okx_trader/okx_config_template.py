@@ -40,6 +40,7 @@ TRAIL_ATR_MULT = 1.0          # 移动止损：跟在价格极值后 1×ATR（�
 MAX_HOLD_BARS = 24            # 时间止损：持有超过 24 根 K 线且 |PnL|<0.3R 平仓
 MAX_OPEN_POSITIONS = 3        # 最多同时持有的仓位数量
 MAX_DRAWDOWN = 0.10           # 回撤熔断：权益自历史高点回撤超过 10% 禁止开新仓
+RISK_ALLOW_NO_STORE = False    # true 仅测试用（生产 fail-closed：R8 查不到风险即拒绝）
 SAME_DIRECTION_RISK_CAP = 0.02
 REGIME_MISMATCH_PENALTY = 1.0  # 人设×市况错配扣分（趋势市压均值回归等）
 
@@ -59,6 +60,7 @@ ATR_BAR = "1H"                # ATR 使用的 K 线周期
 ATR_STOP_MULT = 1.5           # 止损距离下限 = 1.5 × ATR（防止止损太近被噪声扫掉）
 MIN_STOP_DIST_PCT = 0.002     # 止损距离相对入场价的最小比例（0.2%）
 MAX_STOP_DIST_PCT = 0.05      # 止损距离相对入场价的最大比例（5%，太远视为风险失控）
+MIN_TRADES_FOR_STATS = 10     # 反馈回路闸门：已平仓 < 此数不给 LLM 喂战绩
 MIN_RR = 1.5                  # 盈亏比下限：目标空间 / 止损距离
 MIN_TARGET_ATR = 0.5          # 结构位距入场至少 0.5×ATR 才算目标（贴脸的位是噪声不是目标）
 TARGET_ATR_MULT = 2.5         # 无可用结构位时的 ATR 兜底目标倍数

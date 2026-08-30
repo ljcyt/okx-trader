@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 from okx_trader.committee import Committee
+from okx_trader.config import load_config
 from okx_trader.store import write as w
 from okx_trader.store.db import Store
 from okx_trader.store.factors_zoo import (backfill_returns, collect_from_report,
@@ -79,20 +80,53 @@ class MemoryFeedbackTest(unittest.TestCase):
     def _summary(self):
         c = Committee.__new__(Committee)
         c.store = self.store
+        c.cfg = load_config()
         return c.recent_rounds_summary(5)
 
     def test_summary_contains_outcome(self):
         s = self._summary()
         self.assertIn("-1.0R", s)
         self.assertIn("stop", s)
-        self.assertIn("按人设战绩", s)
+        # 1 笔 < 闸门 10 → 战绩段是显式声明而非数字
+        self.assertIn("样本不足", s)
+        self.assertNotIn("胜率", s)
 
     def test_no_trade_does_not_crash(self):
         self.store.execute("DELETE FROM trades")
         s = self._summary()
         self.assertIn("状态=opened", s)
-        self.assertNotIn("按人设战绩", s.split("按人设战绩")[-1] if "按人设战绩" in s
-                         else "")
+        self.assertNotIn("胜率", s)
+
+    def test_track_record_gated_until_min_samples(self):
+        """P1-4：已平仓 < MIN_TRADES_FOR_STATS → 只给显式声明，不给数字。"""
+        for i in range(9):   # 共 1+9=10 笔，先停在 9 笔验证闸门
+            if i < 8:
+                self.store.execute(
+                    "INSERT INTO trades(env, inst_id, direction, opened_ts, "
+                    "contracts, ct_val, entry_px, status, analyst, "
+                    "realized_pnl, r_multiple, exit_reason) "
+                    "VALUES ('replay','ETH-USDT-SWAP','long',?,1,0.1,2000,"
+                    "'closed','趋势猎手',5.0,0.5,'target')",
+                    (time.time() - i * 3600,))
+        s = self._summary()
+        self.assertIn("样本不足", s)
+        self.assertNotIn("胜率", s)
+
+    def test_track_record_shown_after_min_samples(self):
+        """已平仓 ≥ MIN_TRADES_FOR_STATS → 给按人设胜率与累计 R。"""
+        for i in range(9):
+            self.store.execute(
+                "INSERT INTO trades(env, inst_id, direction, opened_ts, "
+                "contracts, ct_val, entry_px, status, analyst, "
+                "realized_pnl, r_multiple, exit_reason) "
+                "VALUES ('replay','ETH-USDT-SWAP','long',?,1,0.1,2000,"
+                "'closed','趋势猎手',5.0,0.5,'target')",
+                (time.time() - i * 3600,))
+        s = self._summary()
+        self.assertIn("按人设战绩", s)
+        self.assertIn("胜率", s)
+        self.assertIn("累计", s)
+        self.assertNotIn("样本不足", s)
 
 
 class FactorZooTest(unittest.TestCase):

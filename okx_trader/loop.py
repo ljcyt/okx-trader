@@ -108,7 +108,7 @@ class TradingLoop:
         self.state = RunState(self.store, self.env.name)   # run_state 适配器
         self.client = make_client(self.env, self.cfg, logger=self.log)
         self.risk = RiskManager(self.cfg, self.client,
-                                self.state)
+                                self.state, env=self.env.name)
         self.committee = Committee(self.cfg, self.client, store=self.store,
                                    env=self.env.name)
         self.round_seq = 0
@@ -387,6 +387,12 @@ class TradingLoop:
             out["status"] = "error"
             out["error"] = str(e)
         finally:
+            # fail-closed：本轮以非正常路径收尾时，绝不能留下未成交的入场单
+            # 等它自己成交（SOL 孤儿单事件：round 27 error 结束，挂单 3 小时后
+            # 自行成交，绕过了全部闸门）。正常路径的 working 单由
+            # _execute_open 自己登记，这里只清"没被登记过的"。
+            if out.get("status") == "error" and self.executing:
+                self._cancel_round_entry_orders(rw)
             self._busy = False
         snap = self.last_snapshot or {}
         hook_trigger("round_done", {"kind": "round_done", "level": "info",
@@ -409,17 +415,114 @@ class TradingLoop:
 
     # ────────────────────────── 持仓巡检 / 崩溃对账 ──────────────────────────
 
+    def _revalidate_orphan(self, inst_id, p, plan, snap):
+        """孤儿仓位收养前重跑 R1-R8（跳过 R4 同标的/R6 Maker——该仓已存在
+        且已成交，重查必自我否决）。通过 → 返回 verdict（None 表示收养
+        后续照走）；不通过 → 市价平仓 + critical 告警，返回 None 并让
+        调用方 skip（不建 trades 行）。
+
+        平仓连败会熔断暂停（两 tick 平不掉就 paused=1 等人工）。"""
+        stop = plan.get("stop_loss") or (p["avg_px"] * (0.98 if p["direction"] == "long"
+                                                       else 1.02))
+        factor_snap = (snap.get("factors") or {}).get(inst_id) or {}
+        recheck = {
+            "instId": inst_id, "direction": p["direction"],
+            "stop_loss": stop, "order_type": "limit_maker",
+            "entry_hint": p["avg_px"], "reason": "孤儿仓位收养复核",
+            "factors": factor_snap,
+        }
+        try:
+            verdict = self.risk.check_open_plan(recheck, revalidate=True)
+            err = None
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("孤儿复核异常（%s）：%s —— 按 fail-closed 平仓",
+                           inst_id, exc)
+            verdict = None
+            err = f"{type(exc).__name__}: {exc}"
+        if verdict is not None and verdict.passed:
+            return verdict
+
+        why = "；".join(verdict.failures) if verdict is not None \
+            else f"复核异常：{err}"
+        rule = verdict.rule_code if verdict is not None else "REVALIDATE"
+        self.log.error("巡检：%s 孤儿仓位复核未通过（%s）——市价平仓，"
+                       "不事后追认未经闸门的仓位", inst_id, why)
+        try:
+            self.client.close_position_market(inst_id, p["direction"])
+            for a in self.client.get_pending_stop_losses(inst_id):
+                try:
+                    self.client.cancel_stop_loss(inst_id, a["algoId"])
+                except Exception:  # noqa: BLE001
+                    pass
+            w.write_event(
+                self.store, self.env.name, "orphan_rejected",
+                f"{inst_id} 孤儿仓位复核未通过（{rule}: {why}），已市价平仓",
+                level="critical", inst_id=inst_id)
+            hook_trigger("orphan_rejected", {
+                "kind": "orphan_rejected", "level": "critical",
+                "inst_id": inst_id, "direction": p["direction"],
+                "message": f"孤儿仓位复核未通过（{rule}），已平仓：{why}"})
+            return None
+        except Exception as e:  # noqa: BLE001
+            # 平仓失败：计连败，两个 tick 平不掉就暂停等人工
+            fails = int(self.store.state_get(self.env, "orphan_close_fails")
+                        or 0) + 1
+            self.store.state_set(self.env, "orphan_close_fails", fails)
+            w.write_event(
+                self.store, self.env.name, "orphan_rejected",
+                f"{inst_id} 孤儿仓位复核未通过（{rule}: {why}），"
+                f"且平仓失败（{e}，第 {fails} 次）",
+                level="critical", inst_id=inst_id)
+            if fails >= 2:
+                self.set_paused(True, reason="孤儿仓位平仓连续失败，等人工处置")
+            return None
+
+    def _cancel_round_entry_orders(self, rw):
+        """撤销本轮挂出但未完成生命周期管理的入场单（异常收尾兜底）。
+
+        撤单失败通常意味着恰好成交——交给巡检的孤儿复核路径处置。"""
+        try:
+            rows = self.store.query(
+                "SELECT exch_ord_id, inst_id FROM orders WHERE round_pk=? "
+                "AND kind='entry' AND state='live'", (rw.pk,))
+        except Exception:  # noqa: BLE001
+            return
+        for o in rows:
+            if not o["exch_ord_id"]:
+                continue
+            try:
+                self.client.cancel_order(o["inst_id"], o["exch_ord_id"])
+                self.store.execute(
+                    "UPDATE orders SET state='canceled', updated_ts=? "
+                    "WHERE exch_ord_id=?",
+                    (time.time(), str(o["exch_ord_id"])))
+                w.write_event(self.store, self.env.name, "round_cleanup",
+                              f"轮次异常结束，撤销残留入场单 "
+                              f"{o['exch_ord_id'][:8]}…（{o['inst_id']}）",
+                              level="warn", inst_id=o["inst_id"], round_pk=rw.pk)
+                self.log.warning("轮次异常收尾：撤残留入场单 %s（%s）",
+                                 o["exch_ord_id"][:8], o["inst_id"])
+            except Exception as e:  # noqa: BLE001
+                # 撤不掉 ≈ 已成交：巡检的孤儿复核（revalidate）会接手
+                self.log.warning("残留单撤销失败（可能已成交，交巡检复核）：%s", e)
+
     def _approved_plan_for(self, inst_id):
         """恢复该标的最近一次【获批】的开仓计划（补记/补挂保护单用）。
 
         trades 的计划字段（stop/target/rr/risk_usdt）以风控批准值为权威：
         R8 聚合、R 倍数分母都依赖它；交易所实际触发价在 orders.sl_trigger_px，
-        两处各司其职。经 orders.round_pk 关联裁决，避免跨轮误取。"""
+        两处各司其职。优先经 orders.round_pk 关联（拿到批准这笔的那轮），
+        无 entry 行时退回最近一次通过裁决。"""
         row = self.store.query_one(
             "SELECT v.stop_loss, v.target, v.rr, v.risk_usdt "
             "FROM risk_verdicts v JOIN orders o ON o.round_pk = v.round_pk "
             "WHERE v.passed=1 AND v.inst_id=? AND o.kind='entry' "
             "ORDER BY o.id DESC LIMIT 1", (inst_id,))
+        if not row:
+            row = self.store.query_one(
+                "SELECT stop_loss, target, rr, risk_usdt "
+                "FROM risk_verdicts WHERE passed=1 AND inst_id=? "
+                "ORDER BY round_pk DESC LIMIT 1", (inst_id,))
         return dict(row) if row else {}
 
     def _patrol_positions(self, snap, rw):
@@ -467,6 +570,12 @@ class TradingLoop:
                 changed = True
                 continue
             plan = self._approved_plan_for(inst_id)
+            # ── P0-2(b) 孤儿复核：仓位绕过完整闸门（重启间隙成交）时，
+            # 收养前用当前数据重跑 R1-R8——批准时的裁决可能已过期数小时，
+            # 市场可能已反向。不过 → 平仓 + critical 告警，绝不事后追认
+            verdict = self._revalidate_orphan(inst_id, p, plan, snap)
+            if verdict is None:
+                continue
             # 审计链：trades.open_round_pk 指向批准这笔交易的轮次
             #（入场单所属 round），不是当前巡检轮——否则面板追溯断裂
             ord_row = self.store.query_one(
@@ -493,6 +602,10 @@ class TradingLoop:
             if open_round_pk is not None and open_round_pk != rw.pk:
                 self.log.info("巡检：%s trades 行审计链指向批准轮 #%s"
                               "（当前巡检轮 #%s）", inst_id, open_round_pk, rw.pk)
+            w.write_event(self.store, self.env.name, "orphan_adopted",
+                          f"{inst_id} 孤儿仓位复核通过（R1-R8 重跑），已收养"
+                          f"（pk={pk}，analyst={sized.get('analyst')}）",
+                          level="warn", inst_id=inst_id, round_pk=rw.pk)
             m["trade_pk"] = pk
             meta[inst_id] = m
             if wo:

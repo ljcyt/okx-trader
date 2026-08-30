@@ -77,6 +77,9 @@ def make_cfg(**kw):
         "ATR_PERIOD": 14, "ATR_BAR": "1H", "ATR_STOP_MULT": 1.5,
         "MIN_STOP_DIST_PCT": 0.002, "MAX_STOP_DIST_PCT": 0.05,
         "MIN_RR": 1.5, "MIN_TARGET_ATR": 0.5, "TARGET_ATR_MULT": 2.5,
+        # stub state 无 store：R8 fail-closed 的测试豁免（生产默认 False，
+        # 真 store 路径见 SameDirectionRiskTest / R8FailClosedTest）
+        "RISK_ALLOW_NO_STORE": True,
     }
     base.update(kw)
     return type("C", (), base)()
@@ -299,6 +302,72 @@ class SameDirectionRiskTest(unittest.TestCase):
         rm = self._rm(store, [("BTC-USDT-SWAP", "long", 0.009)])
         v = rm.check_open_plan(make_plan(direction="short", stop_loss=80400.0))
         self.assertTrue(v.passed, f"反向持仓不应占用同向预算: {v.failures}")
+
+
+class R8FailClosedTest(unittest.TestCase):
+    """P0-1：R8 缺数据一律 fail-closed——同向风险不可知时拒绝，不再折算 0。"""
+
+    def _rm(self, store):
+        from okx_trader.loop import RunState
+        from okx_trader.risk import RiskManager
+        return RiskManager(make_cfg(), StubClient(), RunState(store, "demo"))
+
+    def test_null_risk_open_trade_rejects(self):
+        """存在 status='open' 且 risk_usdt IS NULL 的同向仓 → 拒绝。"""
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        store.execute(
+            "INSERT INTO trades(env, inst_id, direction, opened_ts, contracts, "
+            "ct_val, entry_px, status, analyst, risk_usdt) VALUES "
+            "('demo','BTC-USDT-SWAP','long',1000.0,0.01,0.01,78000.0,'open','t',NULL)")
+        rm = self._rm(store)
+        v = rm.check_open_plan(make_plan())
+        self.assertFalse(v.passed)
+        self.assertTrue(any("R8" in f and "fail-closed" in f
+                            for f in v.failures), v.failures)
+        ev = store.query("SELECT * FROM app_events WHERE kind='rule_fail_closed'")
+        self.assertEqual(len(ev), 1)
+
+    def test_full_risk_open_trades_aggregate_normally(self):
+        """risk_usdt 齐全且已用 1.5% → 本笔预算压缩到剩余 0.5%（原行为不变）。"""
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        store.execute(
+            "INSERT INTO trades(env, inst_id, direction, opened_ts, contracts, "
+            "ct_val, entry_px, status, analyst, risk_usdt) VALUES "
+            "('demo','BTC-USDT-SWAP','long',1000.0,0.01,0.01,78000.0,'open','t',150.0)")
+        rm = self._rm(store)
+        v = rm.check_open_plan(make_plan(stop_loss=79600.0))
+        self.assertTrue(v.passed, v.failures)
+        # 1.5% 已用 → 预算压至 0.5% = 50U
+        self.assertLessEqual(v.sized["risk_usdt"] / 10000.0, 0.005 + 1e-9)
+
+    def test_store_query_error_rejects(self):
+        """store 查询抛异常 → 拒绝。"""
+        from okx_trader.risk import RiskManager
+        store = Store(os.path.join(tempfile.mkdtemp(), "t.db"))
+        rm = self._rm(store)
+        rm._same_dir_open_risk = lambda d: (None, False)   # 模拟查询失败
+        v = rm.check_open_plan(make_plan())
+        self.assertFalse(v.passed)
+        self.assertTrue(any("R8" in f for f in v.failures))
+
+    def test_allow_no_store_passes(self):
+        """RISK_ALLOW_NO_STORE=True + 无 store → 放行（测试 stub 路径）。"""
+        from okx_trader.risk import RiskManager
+        rm = RiskManager(make_cfg(), StubClient(), StubState())
+        v = rm.check_open_plan(make_plan(stop_loss=79600.0))
+        self.assertTrue(v.passed, v.failures)
+
+    def test_no_store_default_rejects(self):
+        """默认配置 + 无 store → 拒绝（生产 fail-closed 默认）。"""
+        from okx_trader.risk import RiskManager
+        rm = RiskManager(make_cfg(RISK_ALLOW_NO_STORE=False), StubClient(),
+                         StubState())
+        v = rm.check_open_plan(make_plan())
+        self.assertFalse(v.passed)
+        self.assertTrue(any("R8" in f and "fail-closed" in f
+                            for f in v.failures), v.failures)
 
 
 if __name__ == "__main__":

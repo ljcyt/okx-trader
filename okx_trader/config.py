@@ -73,6 +73,7 @@ _DEFAULTS = {
     "MAX_TOTAL_LEVERAGE": 3.0,
     "MAX_OPEN_POSITIONS": 3,
     "MAX_DRAWDOWN": 0.10,
+    "RISK_ALLOW_NO_STORE": False,     # true 仅测试用：无持久层时 R8 按无仓位放行（生产 fail-closed）
     "SAME_DIRECTION_RISK_CAP": 0.02,
     "FDR_Q_LEVEL": 0.05,             # BH/FDR 多重检验校正的 q 阈值
     "REGIME_MISMATCH_PENALTY": 1.0,
@@ -87,6 +88,7 @@ _DEFAULTS = {
     "ATR_STOP_MULT": 1.5,
     "MIN_STOP_DIST_PCT": 0.002,
     "MAX_STOP_DIST_PCT": 0.05,
+    "MIN_TRADES_FOR_STATS": 10,       # 反馈回路闸门：已平仓 < 此数不给 LLM 喂战绩
     "MIN_RR": 1.5,
     "MIN_TARGET_ATR": 0.5,
     "TARGET_ATR_MULT": 2.5,

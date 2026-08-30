@@ -23,9 +23,11 @@
     if verdict.passed:
         用 verdict.sized["contracts"] 下单   # 张数以风控计算结果为准，不接受计划自带
 """
+import re
 import time
 
 from .client import OKXAPIError
+from .store import write as _w
 
 
 class RiskVerdict:
@@ -33,6 +35,7 @@ class RiskVerdict:
 
     def __init__(self):
         self.passed = True
+        self.rule_code = None  # 首个失败规则码（R1-R8）
         self.failures = []   # 硬性失败（一票否决）
         self.warnings = []   # 提示（不拦截）
         self.sized = {}      # 风控计算出的仓位参数
@@ -40,6 +43,11 @@ class RiskVerdict:
     def fail(self, reason):
         self.passed = False
         self.failures.append(reason)
+        # 首个失败规则码（孤儿复核告警等消费方用；入库时另行解析完整列表）
+        if not getattr(self, "rule_code", None):
+            m = re.match(r"(R\d)", reason)
+            if m:
+                self.rule_code = m.group(1)
         return self
 
     def warn(self, msg):
@@ -55,15 +63,16 @@ class RiskVerdict:
 
 
 class RiskManager:
-    def __init__(self, cfg, client, state_store):
+    def __init__(self, cfg, client, state_store, env=""):
         self.cfg = cfg
         self.client = client
         self.state = state_store
         self.log = client.log
+        self.env_name = env      # fail-closed 事件入库用（空则跳过事件）
 
     # ────────────────────────── 主入口 ──────────────────────────
 
-    def check_open_plan(self, plan):
+    def check_open_plan(self, plan, revalidate=False):
         """审查一份开仓计划。plan 字段：
             instId     str   必填，如 "BTC-USDT-SWAP"
             direction  str   必填，"long" / "short"
@@ -74,6 +83,10 @@ class RiskManager:
         返回 RiskVerdict；通过时 verdict.sized 里带：
             contracts（张数，以此为准）、entry_ref、stop_loss、notional_usdt、
             risk_usdt、risk_pct、leverage_after
+
+        revalidate=True：孤儿成交仓位的收养复核（仓位已在交易所存在）——
+        跳过 R4 的同标的查重与 R6 的 Maker 检查（该仓已成交，重查必自我
+        否决），其余 R1/R2/R3/R5/R7/R8 全量重跑。
         """
         v = RiskVerdict()
         t_start = time.time()
@@ -93,7 +106,8 @@ class RiskManager:
             v.fail("R1: direction 必须是 long/short")
         if stop <= 0:
             v.fail("R1: 未提供止损价（stop_loss）—— 无止损不允许开仓")
-        if str(plan.get("order_type", "")) != "limit_maker":
+        if str(plan.get("order_type", "")) != "limit_maker" and not revalidate:
+            # revalidate：已成交仓位不存在"重新下单方式"，R6 豁免
             v.fail("R6: 开仓只允许 Maker 限价单（order_type=limit_maker）")
 
         # 前置字段已失败就不用再拉行情了
@@ -161,20 +175,26 @@ class RiskManager:
 
         # ── R4 组合层约束 ──
         same_pos = [p for p in positions if p["instId"] == inst_id]
-        if same_pos:
+        if same_pos and not revalidate:
+            # revalidate：这个仓位正在被收养复核，同标的查重必自我否决
             v.fail(f"R4: {inst_id} 已有持仓（{same_pos[0]['direction']} "
                    f"{same_pos[0]['contracts']} 张），当前版本不允许加仓")
         # 挂着的入场单也算暴露：已有未成交挂单时不重复提交
         # （真实环境查交易所；paper/replay 的 client 返回各自维护的挂单）
         try:
             pending_entries = self.client.get_pending_orders(inst_id)
-        except OKXAPIError:
-            pending_entries = []
-        if pending_entries:
+        except OKXAPIError as e:
+            # fail-closed: 挂单查询失败 = "可能有挂单"，按有处理——
+            # 查不到不等于没有
+            return v.fail(f"R4: 挂单查询失败（{e}），"
+                          f"按可能已有未成交挂单处理，拒绝开仓")
+        if pending_entries and not revalidate:
+            # revalidate：孤儿复核时挂单查询包含的是已成交单的残留记录
             v.fail(f"R4: {inst_id} 已有未成交的入场挂单"
                    f"（ordId={pending_entries[0].get('ordId', '?')}），不重复提交")
 
-        if len(positions) >= self.cfg.MAX_OPEN_POSITIONS:
+        if len(positions) >= self.cfg.MAX_OPEN_POSITIONS and not revalidate:
+            # revalidate：该仓位已在持仓数里，重查上限必自我否决
             v.fail(f"R4: 持仓数量已达上限 {self.cfg.MAX_OPEN_POSITIONS}，禁止再开")
 
         # ── R3 波动率目标仓位计算 ──
@@ -217,7 +237,22 @@ class RiskManager:
             cap = float(getattr(self.cfg, "SAME_DIRECTION_RISK_CAP", 0.0) or 0)
             if cap <= 0:
                 cap = self.cfg.MAX_RISK_PER_TRADE * 2
-            used_usdt = self._same_dir_open_risk(direction)
+            used_usdt, risk_ok = self._same_dir_open_risk(direction)
+            if not risk_ok:
+                # fail-closed: 同向风险不可计算（store 缺失/查询失败/存在
+                # risk_usdt 为 NULL 的 open 仓）——按最保守侧拒绝。
+                # 这条路径曾长期折算成 0，R8 这一票从未真正投过
+                ev_store = getattr(self.state, "store", None)
+                if ev_store is not None:
+                    _w.write_event(
+                        ev_store, self.env_name, "rule_fail_closed",
+                        f"R8: 同向({direction})风险不可计算，fail-closed 拒绝开仓",
+                        level="warn", inst_id=inst_id)
+                return v.fail(
+                    f"R8: 同向({direction})风险不可计算"
+                    f"（存在 risk_usdt 缺失的未平仓位或查询失败），"
+                    f"按 fail-closed 拒绝开仓"
+                )
             used_frac = used_usdt / equity if equity > 0 else 0.0
             remaining_frac = cap - used_frac
             if remaining_frac <= 0:
@@ -250,7 +285,12 @@ class RiskManager:
                 * (p["mark_px"] or p["avg_px"])
                 for p in positions
             )
-            leverage_after = (notional_exist + notional_new) / equity if equity > 0 else 999
+            if revalidate:
+                # 复核仓位已在 positions 里（notional_exist 已含它）——
+                # 再加 notional_new 等于同一笔仓算两遍，必超限自我否决
+                leverage_after = (notional_exist / equity) if equity > 0 else 999
+            else:
+                leverage_after = ((notional_exist + notional_new) / equity)                     if equity > 0 else 999
             if leverage_after > self.cfg.MAX_TOTAL_LEVERAGE:
                 v.fail(
                     f"R4: 总杠杆超限——加仓后名义/权益 = {leverage_after:.2f}x "
@@ -294,7 +334,9 @@ class RiskManager:
             sr = factor_snap.get("sr") or {}
             atr_val = v.sized.get("atr")
             if not atr_val:
-                v.warn("R7 跳过：无 ATR（不该发生，因子快照缺失）")
+                # fail-closed: 无 ATR = 目标/RR 不可计算——跳过等于免检，
+                # 拒绝（R3 正常路径已保证有 ATR，这里只拦脏数据）
+                v.fail("R7: 无 ATR，盈亏比不可计算，拒绝开仓")
             else:
                 sign = 1 if direction == "long" else -1
                 levels = [x for x in (sr.get("resistances", []) if direction == "long"
@@ -349,23 +391,44 @@ class RiskManager:
 
     def _same_dir_open_risk(self, direction):
         """同方向未平仓位的 risk_usdt 之和（来自 trades 表）。
-        无持久层（测试 stub）时返回 0。"""
+
+        返回 (used_usdt, ok)：
+          正常聚合成功 → (值, True)
+          store 不可用 / 查询异常 / 存在 risk_usdt 为 NULL 的 open 仓 →
+              (None, False)——有仓位而风险不可知，比"没有仓位"危险得多，
+              绝不能折算成 0（曾让 R8 这一票从未投过）。
+        """
         store = getattr(self.state, "store", None)
         if store is None:
-            return 0.0
+            # fail-closed: 无持久层 = 同向风险不可计算。
+            # 仅测试 stub（RISK_ALLOW_NO_STORE=True）允许按 0 放行
+            if getattr(self.cfg, "RISK_ALLOW_NO_STORE", False):
+                return 0.0, True
+            return None, False
         try:
+            # NULL 检测先于聚合：SUM 会把 NULL 行折成"没有这行"
+            null_row = store.query(
+                "SELECT COUNT(*) c FROM trades "
+                "WHERE status='open' AND direction=? AND risk_usdt IS NULL",
+                (direction,))
+            if null_row and null_row[0]["c"]:
+                return None, False
             row = store.query(
                 "SELECT COALESCE(SUM(risk_usdt),0) s FROM trades "
                 "WHERE status='open' AND direction=?", (direction,))
-            return float(row[0]["s"] or 0)
+            return float(row[0]["s"] or 0), True
         except Exception:  # noqa: BLE001
-            return 0.0
+            # fail-closed: 查询失败 = 同向风险不可知
+            return None, False
 
     # ────────────────────────── 回撤熔断 ──────────────────────────
 
     def _ladder_tier(self):
         """当前回撤档位：rung 从 run_state 读取（由 tick 维护）。
-        未配置阶梯或 state 不支持时返回 (0, None)。"""
+        未配置阶梯或 state 不支持时返回 (0, None)。
+
+        rung 读取失败（AttributeError 之外的异常）按最高档处理——
+        fail-closed：回撤状态不可知时按最深回撤约束，而不是无约束。"""
         ladder = list(getattr(self.cfg, "DRAWDOWN_LADDER", []) or [])
         if not ladder:
             return 0, None
@@ -373,6 +436,9 @@ class RiskManager:
             rung = int(self.state.get_rung() or 0)
         except AttributeError:  # 测试 stub 没有 rung 概念
             return 0, None
+        except Exception:  # noqa: BLE001
+            # fail-closed: rung 读不到 = 回撤状态不可知 → 取最高档
+            return len(ladder), ladder[-1]
         if 0 < rung <= len(ladder):
             return rung, ladder[rung - 1]
         return rung, None

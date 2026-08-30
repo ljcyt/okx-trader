@@ -105,13 +105,39 @@ class FakeLiveClient:
                                  "tp": tp_px})
         return f"algo{len(self.place_calls)}"
 
+    # ── 孤儿收养复核（P0-2b）所需 ──
+    def get_equity(self):
+        return {"total_eq": 10000.0, "usdt_eq": 10000.0, "usdt_avail": 10000.0}
+
+    def get_positions(self, inst_id=""):
+        return []
+
+    def get_ticker(self, inst_id):
+        return {"instId": inst_id, "last": 2505.0, "bid": 2504.5,
+                "ask": 2505.5, "ask_sz": 10.0, "bid_sz": 10.0,
+                "vol24h_quote": 1e7, "ts": 0}
+
+    def compute_atr(self, inst_id, period=14, bar="1H"):
+        return 25.3
+
+    def round_size(self, sz, lot_sz, min_sz):
+        return round(sz * 100) / 100
+
+    def cancel_stop_loss(self, inst_id, algo_id):
+        pass
+
+    def close_position_market(self, inst_id, direction=""):
+        pass
+
 
 class OcoPatrolTest(unittest.TestCase):
     SNAP = {
         "positions": [{"instId": "ETH-USDT-SWAP", "direction": "long",
                        "contracts": 25.61, "avg_px": 2513.17,
                        "mark_px": 2505.0, "upl": -20.0}],
-        "factors": {"ETH-USDT-SWAP": {"atr": 25.3}},
+        # atr=35：孤儿复核的 2% 兜底止损 ≈50U 距离下，ATR 目标 2.5×35=87.5
+        # → RR≈1.75 ≥ 1.5，复核可通过（该用例聚焦 OCO 补挂，不测拒收）
+        "factors": {"ETH-USDT-SWAP": {"atr": 35.0}},
     }
 
     def test_patrol_reattaches_once_and_keeps_target(self):

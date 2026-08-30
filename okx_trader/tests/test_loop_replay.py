@@ -38,6 +38,10 @@ def make_loop(tmp, script, max_hold=24):
                        store=Store(os.path.join(tmp, "trader.db")))
     loop.executing = True              # 测试强制"会执行"语义（client 是 ReplayClient）
     loop.client = ReplayClient(cfg, logger=loop.log, script=script)
+    # 构造器先把 OKXClient 装进了 risk/committee——换 ReplayClient 后同步引用，
+    # 否则风控复核（get_ticker 等）打到真实 OKX 网络上
+    loop.risk.client = loop.client
+    loop.committee.client = loop.client
     return loop
 
 
@@ -158,11 +162,19 @@ class PatrolBackfillTest(unittest.TestCase):
     而成为死代码，导致交易所有仓位但 trades 表无记录、入场单永远 'live'。"""
 
     def _place_working(self, loop, script_price=78000.0):
-        """挂单不成交 → 进工作单名册（_execute_open 的 working 分支）。"""
+        """挂单不成交 → 进工作单名册（_execute_open 的 working 分支）。
+        附带批准行：巡检收养前会重跑 R1-R8，从裁决恢复计划字段。"""
         entry = maker_fill_px(script_price)
         rw = w.RoundWriter.open(loop.store, "round_1", 1.0, "replay", 1, "baseline")
-        ex = loop._execute_open(sized_plan(entry=entry), rw)
+        plan = sized_plan(entry=entry)
+        ex = loop._execute_open(plan, rw)
         self.assertEqual(ex["status"], "working", f"execution={ex}")
+        loop.store.execute(
+            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
+            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
+            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rw.pk, 1, "OK", "[]", "[]", INST, plan["stop_loss"],
+             plan["target"], plan["rr"], plan["risk_usdt"]))
         self.assertIsNone(loop.store.query_one("SELECT * FROM trades"))
         return rw, entry, ex["ord_id"]
 
@@ -241,19 +253,22 @@ class PatrolBackfillTest(unittest.TestCase):
         rw1, entry, ord_id = self._place_working(loop)
         self._fill_on_exchange(loop, ord_id)
         loop.risk.state.set_working_orders({})
-        loop.store.execute(
-            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
-            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
-            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (rw1.pk, 1, "OK", "[]", "[]", INST, 103.56, 107.825, 1.77, 969.61))
+        # 批准值相对成交价构造（绝对价 103.56/107.825 是 SOL 的真实案例，
+        # 移植到 BTC 77960.5 上会被 R2 距离检查拒收）
+        plan = {"risk_usdt": 969.61, "target": entry + 300.0,
+                "stop_loss": entry - 100.0, "rr": 3.0}
+        loop.store.execute("UPDATE risk_verdicts SET risk_usdt=?, target=?, "
+                           "stop_loss=?, rr=? WHERE round_pk=?",
+                           (plan["risk_usdt"], plan["target"],
+                            plan["stop_loss"], plan["rr"], rw1.pk))
         rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
         loop._patrol_positions(snap_for(loop), rw2)
         tr = dict(loop.store.query_one("SELECT * FROM trades"))
         self.assertEqual(tr["status"], "open")
-        self.assertAlmostEqual(tr["risk_usdt"], 969.61, places=6)
-        self.assertAlmostEqual(tr["target_px"], 107.825, places=6)
-        self.assertAlmostEqual(tr["stop_px"], 103.56, places=6)      # 批准值
-        self.assertAlmostEqual(tr["planned_rr"], 1.77, places=6)
+        self.assertAlmostEqual(tr["risk_usdt"], plan["risk_usdt"], places=6)
+        self.assertAlmostEqual(tr["target_px"], plan["target"], places=6)
+        self.assertAlmostEqual(tr["stop_px"], plan["stop_loss"], places=6)
+        self.assertAlmostEqual(tr["planned_rr"], plan["rr"], places=6)
         # 审计链：open_round_pk 指向批准轮（入场单所属），不是巡检轮
         self.assertEqual(tr["open_round_pk"], rw1.pk)
 
@@ -266,17 +281,15 @@ class PatrolBackfillTest(unittest.TestCase):
         self._fill_on_exchange(loop, ord_id)
         loop.risk.state.set_working_orders({})
         loop.risk.state.set_positions_meta({})
-        loop.store.execute(
-            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
-            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
-            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (rw1.pk, 1, "OK", "[]", "[]", INST, 103.56, 107.825, 1.77, 969.61))
+        loop.store.execute("UPDATE risk_verdicts SET stop_loss=?, target=?, "
+                           "rr=?, risk_usdt=? WHERE round_pk=?",
+                           (entry - 100.0, entry + 300.0, 3.0, 100.0, rw1.pk))
         rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
         loop._patrol_positions(snap_for(loop), rw2)
         protect = loop.store.query_one("SELECT * FROM orders WHERE kind='protect'")
         self.assertIsNotNone(protect)
-        self.assertAlmostEqual(protect["sl_trigger_px"], 103.56, places=6)
-        self.assertAlmostEqual(protect["tp_trigger_px"], 107.825, places=6)
+        self.assertAlmostEqual(protect["sl_trigger_px"], entry - 100.0, places=6)
+        self.assertAlmostEqual(protect["tp_trigger_px"], entry + 300.0, places=6)
         meta = loop.risk.state.get_positions_meta()[INST]
         self.assertEqual(meta["trade_pk"],
                          loop.store.query_one("SELECT id FROM trades")["id"])
@@ -307,6 +320,86 @@ class PatrolBackfillTest(unittest.TestCase):
         self.assertEqual(protect["trade_pk"], tr["id"])
         meta = loop.risk.state.get_positions_meta()[INST]
         self.assertEqual(meta["trade_pk"], tr["id"])
+
+
+class OrphanRevalidationTest(unittest.TestCase):
+    """P0-2：孤儿成交仓位收养前必须重跑 R1-R8，不过即平。"""
+
+    def _orphan_setup(self, stop=None):
+        """挂单不成交 → 名册丢 → 交易所侧成交（SOL 事件的形状）。
+        附带 risk_verdicts 批准行（收养复核从裁决恢复计划字段）。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxpo-"),
+                         script=[{"price": 78000.0, "fill": False}])
+        entry = maker_fill_px(78000.0)
+        rw1 = w.RoundWriter.open(loop.store, "round_1", 1.0, "replay", 1, "baseline")
+        ex = loop._execute_open(sized_plan(entry=entry,
+                                           stop_dist=stop or 100.0), rw1)
+        self.assertEqual(ex["status"], "working")
+        ord_id = ex["ord_id"]
+        stop_px = entry - (stop or 100.0)
+        loop.store.execute(
+            "INSERT INTO risk_verdicts(round_pk, passed, rule_code, "
+            "failures_json, warnings_json, inst_id, stop_loss, target, rr, "
+            "risk_usdt) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (rw1.pk, 1, "OK", "[]", "[]", INST, stop_px, entry + 300.0, 3.0,
+             100.0))
+        loop.risk.state.set_working_orders({})
+        self._fill_on_exchange(loop, ord_id)
+        return loop, rw1, ord_id, entry
+
+    @staticmethod
+    def _fill_on_exchange(loop, ord_id):
+        o = loop.client.orders[ord_id]
+        o["state"] = "filled"
+        o["acc_fill_sz"] = o["sz"]
+        o["avg_px"] = o["px"]
+        loop.client._open(INST, "buy", o["sz"], o["px"])
+
+    def test_orphan_passing_revalidation_adopted(self):
+        """当前数据仍过 R1-R8 → 收养，事件 + 审计链指向批准轮。"""
+        loop, rw1, ord_id, entry = self._orphan_setup()
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        tr = dict(loop.store.query_one("SELECT * FROM trades"))
+        self.assertIsNotNone(tr)
+        self.assertEqual(tr["open_round_pk"], rw1.pk)      # 审计链
+        self.assertEqual(tr["risk_usdt"], tr["risk_usdt"])  # 字段齐
+        ev = loop.store.query_one(
+            "SELECT * FROM app_events WHERE kind='orphan_adopted'")
+        self.assertIsNotNone(ev)
+
+    def test_orphan_failing_revalidation_closed(self):
+        """止损距离超 MAX_STOP_DIST_PCT → 拒收：平仓、不建 trades 行。"""
+        loop, rw1, ord_id, entry = self._orphan_setup(stop=10000.0)  # ~12.8% 距离
+        rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
+        loop._patrol_positions(snap_for(loop), rw2)
+        self.assertIsNone(loop.store.query_one("SELECT * FROM trades"))
+        ev = loop.store.query_one(
+            "SELECT * FROM app_events WHERE kind='orphan_rejected'")
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["level"], "critical")
+        self.assertIn(INST, ev["message"])
+        # 仓位已被平掉
+        self.assertNotIn(INST, loop.client.positions)
+
+    def test_round_error_cancels_leftover_entry(self):
+        """轮次异常收尾 → finally 撤掉本轮残留入场单（堵孤儿源头）。"""
+        tmp = tempfile.mkdtemp(prefix="okxpo-")
+        loop = make_loop(tmp, script=[{"price": 78000.0, "fill": False}])
+        entry = maker_fill_px(78000.0)
+        rw = w.RoundWriter.open(loop.store, "round_e", 1.0, "replay", 1, "baseline")
+        ex = loop._execute_open(sized_plan(entry=entry), rw)
+        self.assertEqual(ex["status"], "working")
+        # 模拟轮次异常路径：out.status=error → finally 撤单
+        out = {"status": "error"}
+        loop._cancel_round_entry_orders(rw)
+        order = loop.store.query_one(
+            "SELECT * FROM orders WHERE kind='entry'")
+        self.assertEqual(order["state"], "canceled")
+        ev = loop.store.query_one(
+            "SELECT * FROM app_events WHERE kind='round_cleanup'")
+        self.assertIsNotNone(ev)
+        self.assertEqual(loop.client.orders[ex["ord_id"]]["state"], "canceled")
 
 
 if __name__ == "__main__":

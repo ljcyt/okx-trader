@@ -11,6 +11,7 @@
 """
 import argparse
 import sys
+import time
 
 
 def _build_cfg(args):
@@ -201,6 +202,40 @@ def cmd_replay(args):
     return 0
 
 
+def cmd_compare(args):
+    """对照实验报告：主库（LLM）vs 影子库（基线）的决策分叉。"""
+    import json as _json
+    from .store.compare import compare
+    main_db = args.main_db
+    if not main_db:
+        import os
+        main_db = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "data", "trader.db")
+    out = compare(main_db, args.shadow_db, env=args.env,
+                  shadow_env=args.shadow_env, horizon_h=args.horizon)
+    st = out["stats"]
+    q = st["quadrant"]
+    print(f"对齐决策点：{st['aligned_decision_points']}（近 30 天，按 1H 桶）")
+    print(f"  两边都开：{q['both_open']}  |  LLM 独有：{q['llm_only']}  |  "
+          f"LLM 过滤掉：{q['filtered']}  |  都弃权：{q['both_hold']}")
+    if st.get("filtered_with_return"):
+        print(f"被过滤机会的 {st['horizon_h']}h 前向收益："
+              f"均值 {st['filtered_mean_fwd_return']:+.2%}"
+              + (f"，t={st['filtered_t_stat']:.2f}"
+                 if st.get("filtered_t_stat") is not None else ""))
+        print(f"  → {st['verdict']}")
+    elif st["filtered_n"]:
+        print(f"被过滤机会 {st['filtered_n']} 个，前向收益数据未满 {st['horizon_h']}h")
+    print("\n被过滤明细：")
+
+    for r in out["filtered"]:
+        fr = f"{r['fwd_return']:+.2%}" if r["fwd_return"] is not None else "n/a"
+        t = time.strftime("%m-%d %H:%M", time.localtime(r["ts"]))
+        print(f"  {t} {r['inst']} {r['baseline_direction']} "
+              f"({r['baseline_analyst']}) → {fr}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="okxt", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -230,6 +265,14 @@ def main(argv=None):
 
     p = sub.add_parser("check-env", help="环境自检（联网）")
     p.set_defaults(fn=cmd_check_env)
+
+    p = sub.add_parser("compare", help="LLM vs 基线影子盘：决策分叉四象限")
+    p.add_argument("--shadow-db", required=True, help="影子实例的 trader.db 路径")
+    p.add_argument("--main-db", default=None, help="主实例库（默认本环境数据目录）")
+    p.add_argument("--env", default="demo", help="主实例环境名")
+    p.add_argument("--shadow-env", default="paper", help="影子实例环境名")
+    p.add_argument("--horizon", type=int, default=24, help="被过滤机会的前向收益窗口（小时）")
+    p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("serve", help="只读 Web 面板（循环跑在别处时用）")
     p.add_argument("--env", choices=["replay", "paper", "demo"])
