@@ -122,6 +122,23 @@ class DrawdownLadderTest(unittest.TestCase):
             "SELECT COUNT(*) c FROM equity_curve WHERE round_pk IS NULL")["c"]
         self.assertEqual(n, 1)
 
+    def test_tick_refreshes_last_snapshot_pnl(self):
+        """面板读 last_snapshot——tick 必须把新鲜权益/持仓刷进去，
+        否则两轮之间（最长 1 小时）面板显示冻结旧数（实测曾虚报 170 U）。"""
+        loop = make_loop(tempfile.mkdtemp(prefix="okxt8d-"))
+        loop.last_snapshot = {"equity": 10000.0, "hwm": 10000.0,
+                              "drawdown": 0.0, "usdt_avail": 0.0,
+                              "positions": []}
+        loop.client.equity = 9950.0
+        loop.client._open("BTC-USDT-SWAP", "buy", 5.0, 78000.0)  # 新持仓出现
+        loop.risk_tick()
+        # 权益 = tick 实时采样值（回放客户端会扣持仓名义），绝非旧的 10000
+        self.assertEqual(loop.last_snapshot["equity"],
+                         loop.client.get_equity()["total_eq"])
+        self.assertNotEqual(loop.last_snapshot["equity"], 10000.0)
+        self.assertEqual([p["instId"] for p in loop.last_snapshot["positions"]],
+                         ["BTC-USDT-SWAP"])
+
     def store_events(self):
         return [r["kind"] for r in self.loop.store.query(
             "SELECT kind FROM app_events")]

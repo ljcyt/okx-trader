@@ -833,6 +833,18 @@ class TradingLoop:
             w.write_equity(self.store, self.env.name, time.time(),
                            equity, hwm, dd, eq["usdt_avail"], None,
                            len(positions))
+        # 面板读 last_snapshot——tick 把新鲜权益/持仓刷进去，否则两轮之间
+        # （最长 1 小时）面板显示的是冻结的旧数（实测曾虚报 170 U）
+        if self.last_snapshot is None:
+            self.last_snapshot = {}
+        if equity is not None:
+            self.last_snapshot.update({
+                "equity": equity, "hwm": hwm, "drawdown": dd,
+                "usdt_avail": eq["usdt_avail"]})
+        try:  # 移动止损/巡检可能刚改过持仓，取管理动作之后的
+            self.last_snapshot["positions"] = self.client.get_positions()
+        except Exception:  # noqa: BLE001
+            self.last_snapshot["positions"] = positions
         ticks = int(self.store.state_get(self.env.name, "risk_ticks") or 0) + 1
         self.store.state_set(self.env.name, "risk_ticks", ticks)
         self.store.state_set(self.env.name, "last_risk_tick_ts", time.time())
