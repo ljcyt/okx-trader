@@ -20,6 +20,18 @@ const post = path => api(path, { method: "POST" });
 
 let LIMITS = {};
 
+/* ── 术语 → 人话（状态、出场原因都翻成大白话）─────────────────── */
+const STATUS_CN = {
+  running: "进行中", steady: "不交易", no_action: "观望",
+  opened: "已开仓", deploy: "已下单", place: "准备下单",
+  planned: "已挂单", working: "挂单中", no_fill: "未成交",
+  risk_rejected: "风控未过", data_unavailable: "行情中断", error: "异常",
+  open: "持仓中", closed: "已平仓", stop: "止损离场", target: "止盈离场",
+  time_stop: "到时离场", stop_failed_closed: "强制平仓",
+};
+const cn = s => STATUS_CN[s] || s;
+const chipCN = s => `<span class="chip ${esc(s)}">${esc(cn(s))}</span>`;
+
 /* ── 登录 ─────────────────────────────────────────────── */
 let LOGIN_HTML = null;   // 初始登录表单（renderers 会覆盖 #app，需要能恢复）
 function renderLogin(err) {
@@ -50,7 +62,8 @@ function renderLogin(err) {
 
 /* ── 总览 ─────────────────────────────────────────────── */
 async function renderOverview() {
-  const [state] = await Promise.all([api("/api/state")]);
+  const [state, latest] = await Promise.all([api("/api/state"),
+                                             api("/api/rounds?size=1")]);
   LIMITS = state.limits || {};
   const a = state.account, lh = state.data_health;
   const badge = $("#env-badge");
@@ -59,42 +72,52 @@ async function renderOverview() {
   $("#exec-badge").textContent = state.executing ? "executing" : "观察模式";
   let html = "";
   if (state.circuit_breaker && state.circuit_breaker.tripped)
-    html += `<div class="banner">⛔ 回撤熔断生效：${esc(state.circuit_breaker.reason)}——禁止开新仓</div>`;
+    html += `<div class="banner">⛔ 亏得太多触发了保护机制：${esc(state.circuit_breaker.reason)}——暂时不开新仓</div>`;
   if (lh && lh.data_ok === 0)
-    html += `<div class="healthbar bad">⚠ 数据健康：全部标的因子获取失败（0/${lh.symbols_total}）——"没数据"不是"没信号"，本轮循环不会跑委员会</div>`;
-  else if (lh)
-    html += `<div class="healthbar">数据健康：因子 ${lh.symbols_ok}/${lh.symbols_total} ✔</div>`;
+    html += `<div class="healthbar bad">⚠ 行情数据拿不到——这轮先不讨论，等下一轮再试</div>`;
   html += `<div class="tiles">
-    <div class="card tile"><div class="v">${fmt(a.equity)}</div><div class="k">账户权益 USDT</div></div>
-    <div class="card tile"><div class="v ${a.total_return >= 0 ? "up" : "down"}">${a.total_return == null ? "—" : (a.total_return >= 0 ? "+" : "") + fmt(a.total_return)}</div><div class="k">累计收益 USDT（含浮动）</div></div>
-    <div class="card tile"><div class="v ${a.total_upl >= 0 ? "up" : "down"}">${a.total_upl == null ? "—" : (a.total_upl >= 0 ? "+" : "") + fmt(a.total_upl)}</div><div class="k">浮动盈亏 USDT（持仓）</div></div>
-    <div class="card tile"><div class="v ${a.realized_pnl >= 0 ? "up" : "down"}">${(a.realized_pnl >= 0 ? "+" : "") + fmt(a.realized_pnl || 0)}</div><div class="k">已实现盈亏 USDT（已平）</div></div>
-    <div class="card tile"><div class="v ${a.drawdown > 0 ? "down" : "up"}">${pct(a.drawdown)}</div><div class="k">距高水位回撤</div></div>
-    <div class="card tile"><div class="v">${(state.positions || []).length}</div><div class="k">当前持仓</div></div>
+    <div class="card tile"><div class="v">${fmt(a.equity)}</div><div class="k">账户权益（USDT）</div></div>
+    <div class="card tile"><div class="v ${a.total_return >= 0 ? "up" : "down"}">${a.total_return == null ? "—" : (a.total_return >= 0 ? "+" : "") + fmt(a.total_return)}</div><div class="k">累计赚了（含还没平的）</div></div>
+    <div class="card tile"><div class="v ${a.total_upl >= 0 ? "up" : "down"}">${a.total_upl == null ? "—" : (a.total_upl >= 0 ? "+" : "") + fmt(a.total_upl)}</div><div class="k">手里持仓的浮动盈亏</div></div>
+    <div class="card tile"><div class="v ${a.realized_pnl >= 0 ? "up" : "down"}">${(a.realized_pnl >= 0 ? "+" : "") + fmt(a.realized_pnl || 0)}</div><div class="k">已经落袋的盈亏</div></div>
+    <div class="card tile"><div class="v ${a.drawdown > 0 ? "down" : "up"}">${pct(a.drawdown)}</div><div class="k">离最近高点回撤</div></div>
+    <div class="card tile"><div class="v">${(state.positions || []).length}</div><div class="k">正在持有</div></div>
   </div>`;
-  // 回撤档位 + 机械 tick（Phase 8）
+
+  // 最新动态：系统每轮在干嘛，说人话
+  const lr = (latest.items || [])[0];
+  if (lr) {
+    const mins = Math.max(0, Math.round(Date.now() / 1000 - lr.ts) / 60);
+    const ago = mins < 1 ? "刚刚" : mins < 60 ? `${Math.round(mins)} 分钟前` :
+      `${Math.round(mins / 60)} 小时前`;
+    html += `<div class="card"><h3>最新动态</h3>
+      <div><b>${esc(cn(lr.status))}</b> <span class="muted">· ${ago}开的会（${ts(lr.ts)}）</span></div>
+      ${lr.reason ? `<div class="wrap" style="margin-top:6px">${esc(lr.reason)}</div>` : ""}
+      <div class="muted" style="margin-top:8px">委员会每小时讨论一次：三位分析师先提案，三位裁判打分，风控把关后才下单。
+      <a href="#/rounds/${esc(lr.round_id)}">看这轮的完整讨论 →</a></div></div>`;
+  }
+
+  // 风控状态：正常时不占版面，只在降档时冒出来说明
   const rung = state.dd_rung || {level: 0, ladder: []};
-  const tickAgo = state.last_risk_tick_ts ?
-    Math.round(Date.now() / 1000 - state.last_risk_tick_ts) : null;
-  html += `<div class="healthbar">回撤档位：第 ${rung.level} 档` +
-    (rung.ladder && rung.level > 0 ?
-      `（risk_mult=${esc(JSON.stringify(rung.ladder[rung.level - 1].risk_mult))}）` : "") +
-    ` · 风 控 tick：${state.risk_ticks || 0} 次` +
-    (tickAgo !== null ? `（${tickAgo}s 前）` : "") + `</div>`;
+  if (rung.level > 0) {
+    const mult = rung.ladder && rung.ladder[rung.level - 1]
+      ? rung.ladder[rung.level - 1].risk_mult : null;
+    html += `<div class="healthbar bad">⚠ 最近亏得有点多，风控自动收缩：每笔投入降到原来的 ${pct(mult ?? 1)}</div>`;
+  }
 
   html += `<div class="card"><h3>当前持仓</h3>`;
   const pos = state.positions || [];
-  if (!pos.length) html += `<div class="muted">无持仓</div>`;
+  if (!pos.length) html += `<div class="muted">空仓中——委员会没找到值得出手的机会，等着就好</div>`;
   else {
-    html += `<table><thead><tr><th>标的</th><th>方向</th><th>张数</th><th>开仓均价</th>
-      <th>标记价</th><th>未实现盈亏</th><th>强平价</th></tr></thead><tbody>`;
+    html += `<table><thead><tr><th>标的</th><th>方向</th><th>数量</th><th>买入价</th>
+      <th>现价</th><th>浮动盈亏</th></tr></thead><tbody>`;
     for (const p of pos)
-      html += `<tr><td>${esc(p.instId)}</td><td>${p.direction === "long" ? "多" : "空"}</td>
+      html += `<tr><td>${esc(p.instId)}</td><td>${p.direction === "long" ? "做多" : "做空"}</td>
         <td class="num">${fmt(p.contracts)}</td><td class="num">${fmt(p.avg_px)}</td>
         <td class="num">${fmt(p.mark_px)}</td>
-        <td class="num ${p.upl >= 0 ? "up" : "down"}">${fmt(p.upl)}</td>
-        <td class="num">${fmt(p.liq_px)}</td></tr>`;
+        <td class="num ${p.upl >= 0 ? "up" : "down"}">${fmt(p.upl)}</td></tr>`;
     html += `</tbody></table>`;
+    html += `<div class="muted" style="margin-top:8px">每笔持仓在交易所都挂了止损单，跌破自动离场，不需要人盯着。</div>`;
   }
   html += `</div>`;
 
@@ -157,19 +180,15 @@ async function renderRounds(params) {
       <select id="f-inst"><option value="">全部标的</option></select>
       <button class="ghost" id="f-go">筛选</button>
     </div>
-    <table><thead><tr><th>时间</th><th>环境</th><th>状态</th><th>胜出提案</th>
-    <th>均分</th><th>风控</th><th>数据</th><th>耗时</th></tr></thead><tbody>`;
+    <table><thead><tr><th>时间</th><th>这轮结果</th><th>谁提议的</th><th>风控</th></tr></thead><tbody>`;
   for (const it of data.items) {
     const wnr = it.winner;
-    const win = wnr ? `${esc(wnr.analyst)} → ${esc(wnr.inst_id)} ${wnr.direction === "long" ? "多" : "空"}` : `<span class="muted">—</span>`;
+    const win = wnr ? `${esc(wnr.analyst)} 建议买${wnr.direction === "long" ? "入" : "出"} ${esc((wnr.inst_id || "").replace("-SWAP", ""))}` : `<span class="muted">没人提议，继续等</span>`;
     html += `<tr onclick="location.hash='#/rounds/${esc(it.round_id)}'">
-      <td>${ts(it.ts)}</td><td>${esc(it.env)}</td>
-      <td><span class="chip ${esc(it.status)}">${esc(it.status)}</span></td>
+      <td>${ts(it.ts)}</td>
+      <td>${chipCN(it.status)}</td>
       <td>${win}</td>
-      <td class="num">${it.winner ? fmt(it.winner.avg_score) : "—"}</td>
-      <td>${it.risk ? `<span class="chip ${it.risk.passed ? "opened" : "risk_rejected"}">${esc(it.risk.rule_code || (it.risk.passed ? "PASS" : "—"))}</span>` : "—"}</td>
-      <td>${it.data_ok === 0 ? '<span class="chip data_unavailable">无数据</span>' : "✔"}</td>
-      <td class="num">${fmt(it.duration_sec, 1)}s</td></tr>`;
+      <td>${it.risk ? (it.risk.passed ? '<span class="chip opened">过关，下单</span>' : '<span class="chip risk_rejected">没过关</span>') : '<span class="muted">—</span>'}</td></tr>`;
   }
   html += `</tbody></table>
     <div class="pager">
@@ -179,9 +198,13 @@ async function renderRounds(params) {
     </div></div>`;
   $("#app").innerHTML = html;
   const st = $("#f-status"), inst = $("#f-inst");
-  for (const s of ["data_unavailable", "no_action", "risk_rejected", "no_fill", "opened", "planned", "error"])
-    st.add(new Option(s, s));
-  for (const s of (LIMITS.SYMBOLS || [])) inst.add(new Option(s, s));
+  for (const [v, label] of [["", "全部结果"], ["no_action", "观望"], ["opened", "已开仓"],
+                            ["planned", "已挂单"], ["risk_rejected", "风控没过"],
+                            ["no_fill", "没成交"], ["error", "异常"],
+                            ["data_unavailable", "行情中断"]])
+    st.add(new Option(label, v));
+  for (const s of (LIMITS.SYMBOLS || []))
+    inst.add(new Option(s.replace("-SWAP", ""), s));
   st.value = params.status || ""; inst.value = params.inst || "";
   $("#f-go").onclick = () => {
     const p = new URLSearchParams({ status: st.value, inst: inst.value, page: 1 });
@@ -200,12 +223,11 @@ const R7_NOTES = {
 async function renderRoundDetail(rid) {
   const d = await api("/api/rounds/" + encodeURIComponent(rid));
   const rd = d.round;
-  let html = `<div class="card"><h3>轮次 ${esc(rd.round_id)}
-    <span class="chip ${esc(rd.status)}">${esc(rd.status)}</span></h3>
-    <div class="muted">${ts(rd.ts)} · env=${esc(rd.env)} · executing=${rd.executing} ·
-      llm=${esc(rd.llm_mode)} · 权益 ${fmt(rd.equity)} · 回撤 ${pct(rd.drawdown)} ·
-      因子 ${rd.symbols_ok}/${rd.symbols_total}</div>
-    ${rd.reason ? `<div class="wrap">${esc(rd.reason)}</div>` : ""}</div>`;
+  let html = `<div class="card"><h3>这一轮的讨论
+    ${chipCN(rd.status)}</h3>
+    <div class="muted">${ts(rd.ts)} · ${esc(rd.env) === "demo" ? "模拟盘" : esc(rd.env)} ·
+      权益 ${fmt(rd.equity)} · 回撤 ${pct(rd.drawdown)}</div>
+    ${rd.reason ? `<div class="wrap" style="margin-top:8px">${esc(rd.reason)}</div>` : ""}</div>`;
 
   html += `<div class="step"><h4>Step 0 · 输入（因子快照 = 分析师实际看到的数字）</h4><div class="grid3">`;
   for (const f of d.factors) {
@@ -338,17 +360,15 @@ async function renderTrades() {
   html += `<div class="card"><h3>交易记录（${data.total}）</h3>`;
   if (!data.items.length) html += `<div class="muted">还没有交易——纸面/回放模式不产生真实成交</div>`;
   else {
-    html += `<table><thead><tr><th>开仓时间</th><th>标的</th><th>方向</th><th>张数</th><th>入场</th><th>出场</th>
-      <th>计划RR</th><th>盈亏</th><th>R倍数</th><th>出场原因</th><th>分析师</th></tr></thead><tbody>`;
+    html += `<table><thead><tr><th>开仓时间</th><th>标的</th><th>方向</th><th>买入价</th><th>卖出价</th>
+      <th>盈亏</th><th>结果</th><th>谁提议的</th></tr></thead><tbody>`;
     for (const t of data.items)
       html += `<tr onclick="location.hash='#/trades/${t.id}'">
-        <td>${ts(t.opened_ts)}</td><td>${esc(t.inst_id)}</td>
-        <td>${t.direction === "long" ? "多" : "空"}</td><td class="num">${fmt(t.contracts)}</td>
+        <td>${ts(t.opened_ts)}</td><td>${esc((t.inst_id || "").replace("-SWAP", ""))}</td>
+        <td>${t.direction === "long" ? "买入" : "卖出"}</td>
         <td class="num">${fmt(t.entry_px)}</td><td class="num">${fmt(t.exit_px)}</td>
-        <td class="num">${fmt(t.planned_rr)}</td>
         <td class="num ${t.realized_pnl >= 0 ? "up" : "down"}">${fmt(t.realized_pnl)}</td>
-        <td class="num">${fmt(t.r_multiple)}R</td>
-        <td><span class="chip ${esc(t.exit_reason || "open")}">${esc(t.exit_reason || "open")}</span></td>
+        <td>${chipCN(t.exit_reason || t.status)}</td>
         <td>${esc(t.analyst || "—")}</td></tr>`;
     html += `</tbody></table>`;
   }
@@ -371,12 +391,12 @@ async function renderTrades() {
 async function renderTradeDetail(id) {
   const d = await api("/api/trades/" + encodeURIComponent(id));
   const t = d.trade;
-  let html = `<div class="card"><h3>${esc(t.inst_id)} ${t.direction === "long" ? "多" : "空"}
-    <span class="chip ${esc(t.exit_reason || t.status)}">${esc(t.exit_reason || t.status)}</span></h3>
-    <div>入场 ${fmt(t.entry_px)} → 出场 ${fmt(t.exit_px)} · ${fmt(t.contracts)} 张 ·
-    盈亏 <b class="${t.realized_pnl >= 0 ? "up" : "down"}">${fmt(t.realized_pnl)}</b>（${fmt(t.r_multiple)}R） ·
-    分析师 ${esc(t.analyst || "—")} · 委员会分 ${fmt(t.committee_score)}</div>
-    ${d.open_round_id ? `<div><a href="#/rounds/${esc(d.open_round_id)}">查看开仓轮的委员会讨论 →</a></div>` : ""}</div>`;
+  let html = `<div class="card"><h3>${esc((t.inst_id || "").replace("-SWAP", ""))} ${t.direction === "long" ? "买入" : "卖出"}
+    ${chipCN(t.exit_reason || t.status)}</h3>
+    <div>买入价 ${fmt(t.entry_px)} → 卖出价 ${fmt(t.exit_px)} ·
+    盈亏 <b class="${t.realized_pnl >= 0 ? "up" : "down"}">${fmt(t.realized_pnl)}</b> ·
+    提议人 ${esc(t.analyst || "—")}</div>
+    ${d.open_round_id ? `<div style="margin-top:6px"><a href="#/rounds/${esc(d.open_round_id)}">看当时委员会为什么买它 →</a></div>` : ""}</div>`;
   html += `<div class="card"><h3>订单</h3><table><tbody>`;
   for (const o of d.orders)
     html += `<tr><td>${esc(o.kind)}</td><td>${esc(o.ord_type)}</td><td class="num">${fmt(o.px)}</td>
@@ -403,8 +423,7 @@ async function renderFactors() {
   const c = data.counts;
   let html = `<div class="card"><h3>因子动物园 · core ${c.core || 0} · observing ${c.observing || 0} ·
     trial ${c.trial || 0} · active ${c.active || 0} · retired ${c.retired || 0} · rejected ${c.rejected || 0}</h3>
-    <div class="muted">晋级门槛：${data.gate.scored_days || 15}+ 计分日 · ${data.gate.days_tracked || 30}+ 天 tracked ·
-    正 rank-IC —— 未晋级的因子不影响下单（unproven edge never touches the book）</div>
+    <div class="muted">这些"信号"要先连续多日验证确实有效，才会被拿来做决策——没验证过的绝不影响下单。</div>
     <table style="margin-top:10px"><thead><tr><th>因子</th><th>族</th><th>层</th><th>状态</th>
     <th>IC</th><th>rank-IC</th><th>命中率</th><th>观测数</th><th>tracked 天数</th></tr></thead><tbody>`;
   for (const f of data.items) {
