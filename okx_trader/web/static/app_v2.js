@@ -128,18 +128,18 @@ async function renderEquity() {
     let grid = "", labels = "";
     for (let i = 0; i <= 4; i++) {
       const v = ymin - pad + (ymax + pad - (ymin - pad)) * i / 4;
-      grid += `<line x1="${PL}" x2="${W - PR}" y1="${Y(v)}" y2="${Y(v)}" stroke="#21262d"/>`;
-      labels += `<text x="${PL - 6}" y="${Y(v) + 4}" fill="#8b949e" font-size="11" text-anchor="end">${fmt(v, 0)}</text>`;
+      grid += `<line x1="${PL}" x2="${W - PR}" y1="${Y(v)}" y2="${Y(v)}" stroke="rgba(255,255,255,0.07)"/>`;
+      labels += `<text x="${PL - 6}" y="${Y(v) + 4}" fill="rgba(255,255,255,0.45)" font-size="11" text-anchor="end">${fmt(v, 0)}</text>`;
     }
     html += `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
       ${grid}${labels}
-      <path d="${ddArea}" fill="rgba(248,81,73,.10)"/>
-      <path d="${hwmPath}" fill="none" stroke="#6e7681" stroke-width="1" stroke-dasharray="4 3"/>
-      <path d="${eqPath}" fill="none" stroke="#58a6ff" stroke-width="1.6"/>
-      <text x="${PL}" y="${H - 6}" fill="#8b949e" font-size="11">${ts(x0)}</text>
-      <text x="${W - PR}" y="${H - 6}" fill="#8b949e" font-size="11" text-anchor="end">${ts(x1)}</text>
+      <path d="${ddArea}" fill="rgba(227,155,155,0.10)"/>
+      <path d="${hwmPath}" fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="1" stroke-dasharray="4 3"/>
+      <path d="${eqPath}" fill="none" stroke="#7C9CC4" stroke-width="1.6"/>
+      <text x="${PL}" y="${H - 6}" fill="rgba(255,255,255,0.45)" font-size="11">${ts(x0)}</text>
+      <text x="${W - PR}" y="${H - 6}" fill="rgba(255,255,255,0.45)" font-size="11" text-anchor="end">${ts(x1)}</text>
     </svg>
-    <div class="muted">蓝=权益 · 灰虚=高水位 · 红域=回撤</div></div>`;
+    <div class="muted">月蓝=权益 · 白虚=高水位 · 红域=回撤</div></div>`;
   }
   $("#app").innerHTML = html;
 }
