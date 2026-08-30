@@ -453,12 +453,21 @@ class TradingLoop:
                 meta[inst_id] = m
                 changed = True
                 continue
+            plan = self._approved_plan_for(inst_id)
             sized = {"instId": inst_id, "direction": p["direction"],
-                     "stop_loss": m.get("stop") or (wo or {}).get("stop"),
-                     "target": m.get("target") or (wo or {}).get("target"),
-                     "rr": None, "risk_usdt": None,
+                     "stop_loss": plan.get("stop_loss") or m.get("stop")
+                     or (wo or {}).get("stop"),
+                     "target": plan.get("target") or m.get("target")
+                     or (wo or {}).get("target"),
+                     "rr": plan.get("rr"),
+                     "risk_usdt": plan.get("risk_usdt"),
                      "analyst": (wo or {}).get("analyst") or m.get("analyst"),
                      "committee_score": m.get("committee_score")}
+            if plan:
+                self.log.info("巡检：%s 计划字段从风控裁决恢复（risk=%.2fU, "
+                              "stop=%s, target=%s）", inst_id,
+                              plan.get("risk_usdt") or 0,
+                              plan.get("stop_loss"), plan.get("target"))
             pk = open_trade_row(self, rw, sized, p["contracts"], p["avg_px"])
             m["trade_pk"] = pk
             meta[inst_id] = m
