@@ -45,6 +45,14 @@ class _TickWriter:
         w.write_order(self.store, env, inst_id, kind, ord_type, **kw)
 
 
+def _realized_equity(total_eq, positions):
+    """已实现权益 = 总权益 − Σ未实现盈亏。浮盈是纸面的，不算真收益；
+    阶梯/熔断只看这个，退潮的浮盈不会把系统推进降档区间。"""
+    upl = sum(float(p.get("upl") or 0) for p in positions
+              if isinstance(p, dict))
+    return total_eq - upl
+
+
 class RunState:
     """risk.py 需要的 state 接口（get_hwm/update_hwm）适配到 run_state 表。
     key 按 env 隔离——纸面高水位污染真实账户熔断器在结构上不可能。"""
@@ -61,6 +69,18 @@ class RunState:
         hwm = max(self.get_hwm(), float(equity))
         self.store.state_set(self.env, "equity_hwm", hwm)
         dd = (hwm - float(equity)) / hwm if hwm > 0 else 0.0
+        return hwm, dd
+
+    # 已实现高水位（阶梯/熔断用）：浮盈冲高再回撤不该把系统推进降档——
+    # 市价权益的纸面峰值不是真损失，只有已平仓的亏损才是
+    def get_realized_hwm(self):
+        v = self.store.state_get(self.env, "realized_hwm")
+        return float(v) if v else 0.0
+
+    def update_realized_hwm(self, realized_eq):
+        hwm = max(self.get_realized_hwm(), float(realized_eq))
+        self.store.state_set(self.env, "realized_hwm", hwm)
+        dd = (hwm - float(realized_eq)) / hwm if hwm > 0 else 0.0
         return hwm, dd
 
     # 回撤档位（tick 评估，滞回降档）
@@ -176,8 +196,11 @@ class TradingLoop:
         "没数据"绝不伪装成"没信号"。"""
         equity_info = self.client.get_equity()
         equity = equity_info["total_eq"]
-        hwm, drawdown = self.risk.state.update_hwm(equity)
         positions = self.client.get_positions()
+        # 市价权益高水位（展示/equity_curve）+ 已实现高水位（阶梯/熔断）双轨
+        hwm, drawdown = self.risk.state.update_hwm(equity)
+        realized_eq = _realized_equity(equity, positions)
+        self.risk.state.update_realized_hwm(realized_eq)
 
         factors, factor_errors = {}, {}
         for inst_id in self.cfg.SYMBOLS:
@@ -973,14 +996,20 @@ class TradingLoop:
         权益必须先采样——阶梯判断用新鲜数字，不能用最多 1 小时前的快照。"""
         if self.paused:
             return
-        try:  # 先采样权益并抬升高水位（阶梯与曲线都用这份新鲜值）
+        try:  # 先采样权益（市价），持仓稍后取——阶梯用已实现口径
             eq = self.client.get_equity()
-            hwm, dd = self.risk.state.update_hwm(eq["total_eq"])
             equity = eq["total_eq"]
         except Exception:  # noqa: BLE001
-            equity = hwm = dd = None
+            equity = None
             self.log.warning("tick 权益采样失败，本轮阶梯跳过", exc_info=True)
         positions = self.client.get_positions()
+        # 市价高水位（展示）+ 已实现高水位（阶梯/熔断）双轨
+        hwm = dd = realized_hwm = realized_dd = realized_eq = None
+        if equity is not None:
+            hwm, dd = self.risk.state.update_hwm(equity)
+            realized_eq = _realized_equity(equity, positions)
+            realized_hwm, realized_dd = self.risk.state.update_realized_hwm(
+                realized_eq)
         tick_rw = _TickWriter(self.store)
         # ATR 用最近一轮的因子值（避免每 tick 重复拉 K 线）
         factors = {}
@@ -994,8 +1023,10 @@ class TradingLoop:
         self._patrol_positions(snap, tick_rw)
         manage_open_positions(self, snap, tick_rw)
         # is not None 而非真值判断：权益恰好 0.0（爆仓级回撤）正是最该触发末档的时刻
+        if realized_eq is not None and realized_hwm is not None:
+            self._evaluate_drawdown_ladder(tick_rw, equity=realized_eq,
+                                           hwm=realized_hwm)
         if equity is not None and hwm is not None and dd is not None:
-            self._evaluate_drawdown_ladder(tick_rw, equity=equity, hwm=hwm)
             w.write_equity(self.store, self.env.name, time.time(),
                            equity, hwm, dd, eq["usdt_avail"], None,
                            len(positions))

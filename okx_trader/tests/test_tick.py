@@ -110,10 +110,11 @@ class DrawdownLadderTest(unittest.TestCase):
 
     def test_tick_uses_fresh_equity_not_stale_snapshot(self):
         """高2 回归：risk_tick 必须用本 tick 新采样的权益评估阶梯，
-        即使 last_snapshot 是 None（首次 round 之前）也能触发。"""
+        即使 last_snapshot 是 None（首次 round 之前）也能触发。
+        阶梯用【已实现】口径（replay 仓位无 upl，已实现=市价）。"""
         loop = make_loop(tempfile.mkdtemp(prefix="okxt8c-"))
         self.assertIsNone(loop.last_snapshot)   # 尚未跑过任何 round
-        loop.risk.state.update_hwm(10000.0)     # 高水位来自此前的高点
+        loop.risk.state.update_realized_hwm(10000.0)  # 已实现高水位来自此前高点
         loop.client.equity = 9500.0             # 权益跌到 9500 → 回撤 5%
         loop.risk_tick()
         self.assertEqual(loop.risk.state.get_rung(), 1)

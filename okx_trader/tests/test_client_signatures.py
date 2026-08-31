@@ -79,7 +79,9 @@ CASES = [
     ("get_taker_volume_ratio", "trading_data", "get_taker_volume",
      lambda cl: cl.get_taker_volume_ratio("BTC")),
     ("place_maker_limit", "trade", "place_order",
-     lambda cl: cl.place_maker_limit(INST, "buy", 10.0)),
+     # 显式 px：不传时 maker_price 会调 get_ticker 打真实网络，
+     # 与本次 trap 无关且结果随环境漂移
+     lambda cl: cl.place_maker_limit(INST, "buy", 10.0, px=50000.0)),
     ("close_position_market", "trade", "close_positions",
      lambda cl: cl.close_position_market(INST, "long")),
     ("cancel_order", "trade", "cancel_order",

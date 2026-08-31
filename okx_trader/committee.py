@@ -15,6 +15,7 @@ import time
 
 from .factors import regime_label
 from .llm import LLMClient
+from .risk import select_target
 from .store import write as w
 
 # 裁判法定人数：有效票不足此数时提案不能胜出（防止 LLM 超时导致单裁判独裁）
@@ -200,6 +201,7 @@ class Committee:
             rep = (snapshot.get("factors") or {}).get(p.get("instId"))
             if rep:
                 p["regime"] = regime_label(rep, self.cfg)
+                self._annotate_plan_target(p, rep)
 
         if not proposals:
             return {"action": "hold", "mode": self.llm_mode_name(),
@@ -356,7 +358,12 @@ class Committee:
                     elif reg == "trending_down" and p.get("direction") == "long":
                         mismatch = ("trending_down 市压趋势做多", rp)
             elif reg == "ranging" and style == "trend":
-                mismatch = ("ranging 市压趋势跟随", rp)
+                # ranging 对趋势人设只轻压（0.5×rp 而非全额）：
+                # regime_label 用的是 |EMA gap|/ATR 分离幅度（阈值 1.0 才算
+                # 趋势），而人设的"多头/空头排列"是排序信号——实测多头排列
+                # 样本的 gap 中位只有 0.44，弱趋势被全额扣分等于把唯一有
+                # 通过记录的人设在震荡市里系统性压死，三个方向全熄火
+                mismatch = ("ranging 市压趋势跟随（弱趋势，轻压）", rp * 0.5)
             elif reg == "high_vol":
                 mismatch = ("高波动统压", rp * 0.5)
             if mismatch:
@@ -520,13 +527,44 @@ class Committee:
 
     # ────────────────────────── 裁判 ──────────────────────────
 
+    def _annotate_plan_target(self, p, rep):
+        """给提案标注 R7 将采用的目标价/RR（与风控共用 select_target）。
+
+        裁判打分前注入 p["plan_target"]/p["plan_rr"]/p["plan_target_source"]，
+        让裁判评的是风控实际会用的那个数——之前裁判只看因子报告里的原始
+        sr 列表，空头下方支撑为空时判"RR 无法度量"而否决，可 R7 本来会
+        用 ATR 兜底目标，软硬两层口径分裂系统性地否决了空头提案。
+        """
+        try:
+            entry = _f(p.get("entry_hint")) or _f(rep.get("price"))
+            stop = _f(p.get("stop_loss"))
+            atr = _f(rep.get("atr"))
+            if not entry or not stop or not atr:
+                return
+            stop_dist = abs(entry - stop)
+            if stop_dist <= 0:
+                return
+            st = select_target(self.cfg, entry, stop_dist, p.get("direction"),
+                               rep.get("sr") or {}, atr)
+            p["plan_target"] = round(st["target"], 6)
+            p["plan_target_source"] = st["target_source"]
+            p["plan_rr"] = round(st["rr"], 2)
+            if st["nearest_note"]:
+                p["plan_rr_note"] = st["nearest_note"]
+        except Exception:  # noqa: BLE001 —— 标注是增益，失败不影响决策
+            pass
+
     def _ask_judges(self, proposals, factor_text, account_ctx, snapshot):
         """所有裁判对所有提案打分。返回 {"rows": [{idx, judge, score, approved, concerns}]}。"""
         rows = []
         if self.llm.available:
             props_text = "\n".join(
                 f"提案{i}（来自{p['analyst']}）：{p['instId']} {p['direction']} "
-                f"止损 {p['stop_loss']} 置信度 {p.get('confidence')}；理由：{p['reason']}"
+                f"止损 {p['stop_loss']} 置信度 {p.get('confidence')}"
+                + (f"；系统目标 {p.get('plan_target')} "
+                   f"（{p.get('plan_target_source')}，RR≈{p.get('plan_rr')}）"
+                   if p.get("plan_target") else "")
+                + f"；理由：{p['reason']}"
                 for i, p in enumerate(proposals))
             for j in JUDGES:
                 user = (f"因子报告：\n{factor_text}\n\n{account_ctx}\n\n候选提案：\n{props_text}\n\n"

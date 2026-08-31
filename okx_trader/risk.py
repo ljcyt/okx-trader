@@ -54,6 +54,55 @@ class RiskVerdict:
         self.warnings.append(msg)
         return self
 
+
+def select_target(cfg, entry_ref, stop_dist, direction, sr, atr_val):
+    """R7 的目标选择（模块级，裁判与风控共用同一实现——消除软硬两层
+    各算各的 RR 而系统性地否决一整类提案）。
+
+    返回 dict：
+      target        目标价（含 ATR 兜底）
+      target_source 'structure' | 'atr_multiple'
+      rr            abs(target - entry_ref) / stop_dist
+      nearest_note  最近结构位的 RR 提示（批准依赖远位时非空）
+
+    目标选择：按距离升序找"最近的、值得去的"结构位——
+      1) 距入场 < MIN_TARGET_ATR×ATR 的位过滤（贴脸位是噪声，不是目标）
+      2) 取第一个 RR ≥ MIN_RR 的位
+      3) 都没有 → TARGET_ATR_MULT×ATR 兜底（target_source='atr_multiple'）
+    空头方向结构位（supports）为空时走 3——与做多对称，不再"无法度量"。
+    """
+    sign = 1 if direction == "long" else -1
+    levels = [x for x in (sr.get("resistances", []) if direction == "long"
+                          else sr.get("supports", []))
+              if sign * (x - entry_ref) > 0]
+    levels.sort(key=lambda x: abs(x - entry_ref))
+    min_target_dist = float(getattr(cfg, "MIN_TARGET_ATR", 0.5) or 0.5) * atr_val
+    min_rr = float(getattr(cfg, "MIN_RR", 1.5) or 1.5)
+    target, target_source = None, None
+    for lv in levels:
+        dist = abs(lv - entry_ref)
+        if dist < min_target_dist:
+            continue
+        if dist / stop_dist >= min_rr:
+            target, target_source = lv, "structure"
+            break
+    if target is None:
+        target = entry_ref + sign * float(
+            getattr(cfg, "TARGET_ATR_MULT", 2.5) or 2.5) * atr_val
+        target_source = "atr_multiple"
+    rr = abs(target - entry_ref) / stop_dist
+    nearest_note = None
+    if levels and rr >= min_rr:
+        rr_nearest = abs(levels[0] - entry_ref) / stop_dist
+        if rr_nearest < min_rr:
+            nearest_note = (
+                f"最近结构位 {levels[0]:.4g} 的 RR 仅 {rr_nearest:.2f}"
+                f"（< {min_rr}，距入场 {abs(levels[0] - entry_ref):.4g}）"
+                f"——批准依赖更远目标，价格可能先在近位受阻")
+    return {"target": target, "target_source": target_source,
+            "rr": rr, "nearest_note": nearest_note}
+
+
     def __str__(self):
         tag = "通过" if self.passed else "拒绝"
         lines = [f"风控结论：{tag}"]
@@ -324,12 +373,8 @@ class RiskManager:
             )
 
             # ── R7 盈亏比检查（RR ≥ MIN_RR 才出手；无条件执行，永远算出 target/rr）──
-            # 目标选择：按距离升序找"最近的、值得去的"结构位——
-            #   1) 距入场 < MIN_TARGET_ATR×ATR 的位直接过滤（贴脸的位是噪声，不是目标；
-            #      旧逻辑取"最近位"曾被 0.41×ATR 外的贴脸阻力以 RR=0.31 否决过本可通过的交易）
-            #   2) 取第一个 RR 达标的位（一个近位不再否决有远位支撑的交易）
-            #   3) 都没有 → TARGET_ATR_MULT×ATR 兜底（target_source='atr_multiple'），
-            #      突破单在结构位方向没有位时也逃不过 RR 检查
+            # 目标选择已抽成 select_target：裁判与风控共用同一实现，
+            # 消除"裁判看空 supports 说无法度量 RR、R7 却会用 ATR 兜底"的口径分裂
             factor_snap = plan.get("factors") or {}
             sr = factor_snap.get("sr") or {}
             atr_val = v.sized.get("atr")
@@ -338,47 +383,23 @@ class RiskManager:
                 # 拒绝（R3 正常路径已保证有 ATR，这里只拦脏数据）
                 v.fail("R7: 无 ATR，盈亏比不可计算，拒绝开仓")
             else:
-                sign = 1 if direction == "long" else -1
-                levels = [x for x in (sr.get("resistances", []) if direction == "long"
-                                      else sr.get("supports", []))
-                          if sign * (x - entry_ref) > 0]
-                levels.sort(key=lambda x: abs(x - entry_ref))
-                min_target_dist = self.cfg.MIN_TARGET_ATR * atr_val
-                target, target_source = None, None
-                for lv in levels:
-                    dist = abs(lv - entry_ref)
-                    if dist < min_target_dist:
-                        continue
-                    if dist / stop_dist >= self.cfg.MIN_RR:
-                        target, target_source = lv, "structure"
-                        break
-                if target is None:
-                    target = entry_ref + sign * self.cfg.TARGET_ATR_MULT * atr_val
-                    target_source = "atr_multiple"
-                rr = abs(target - entry_ref) / stop_dist
+                st = select_target(self.cfg, entry_ref, stop_dist, direction,
+                                   sr, atr_val)
+                rr = st["rr"]
                 if rr < self.cfg.MIN_RR:
                     v.fail(
-                        f"R7: 盈亏比不足——目标 {target:.4g}（{target_source}），"
-                        f"止损距离 {stop_dist:.4g}，RR={rr:.2f} < {self.cfg.MIN_RR}"
+                        f"R7: 盈亏比不足——目标 {st['target']:.4g}"
+                        f"（{st['target_source']}），止损距离 {stop_dist:.4g}，"
+                        f"RR={rr:.2f} < {self.cfg.MIN_RR}"
                     )
                 else:
-                    v.sized["target"] = round(target, 6)
-                    v.sized["target_source"] = target_source
+                    v.sized["target"] = round(st["target"], 6)
+                    v.sized["target_source"] = st["target_source"]
                     v.sized["rr"] = round(rr, 2)
-                    v.warn(f"盈亏比 RR={rr:.2f}（目标 {target:.4g}，来源 {target_source}）")
-                    # 双口径显式化：最近结构位（不过滤贴脸位）的 RR 单独报——
-                    # 批准 RR 依赖"跳过近位取远位"的取舍，裁判与审计都看得到，
-                    # 而不是软硬两层各算各的（资管裁判曾按最近位算出 0.33 并
-                    # 四次正确提示同向叠加，而 R7 按 107.825 批出 1.77）
-                    if levels:
-                        rr_nearest = abs(levels[0] - entry_ref) / stop_dist
-                        if rr_nearest < self.cfg.MIN_RR:
-                            v.warn(
-                                f"最近结构位 {levels[0]:.4g} 的 RR 仅 "
-                                f"{rr_nearest:.2f}（< {self.cfg.MIN_RR}，"
-                                f"距入场 {abs(levels[0] - entry_ref):.4g}）——"
-                                f"批准依赖更远目标，价格可能先在近位受阻"
-                            )
+                    v.warn(f"盈亏比 RR={rr:.2f}（目标 {st['target']:.4g}，"
+                           f"来源 {st['target_source']}）")
+                    if st["nearest_note"]:
+                        v.warn(st["nearest_note"])
 
         self.log.info(
             "风控审查 %s %s：%s（%.0fms）",
@@ -444,7 +465,11 @@ class RiskManager:
         return rung, None
 
     def is_drawdown_breach(self, equity):
-        """权益距高水位回撤是否超过 MAX_DRAWDOWN。"""
+        """权益距高水位回撤是否超过 MAX_DRAWDOWN（二元熔断兜底，仅无阶梯时用）。
+
+        注：生产配了 DRAWDOWN_LADDER，真正的降档判定走 tick 的
+        _evaluate_drawdown_ladder（已实现口径）；这里是旧版无阶梯时的
+        二元兜底，维持市价口径不变。"""
         hwm = self.state.get_hwm()
         if hwm <= 0:  # 首次运行还没有高水位
             return False

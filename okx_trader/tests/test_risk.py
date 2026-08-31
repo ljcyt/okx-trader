@@ -370,5 +370,45 @@ class R8FailClosedTest(unittest.TestCase):
                             for f in v.failures), v.failures)
 
 
+class SelectTargetTest(unittest.TestCase):
+    """R7 目标选择（select_target）——评审发现：空头下方支撑为空时，
+    旧口径判"RR 无法度量"而系统性否决空头提案。ATR 兜底必须对称可用。"""
+
+    def test_short_with_empty_supports_uses_atr_fallback(self):
+        from okx_trader.risk import select_target
+        cfg = make_cfg()
+        # 空头：supports 为空，resistances 有值但不属于空头目标方向
+        sr = {"supports": [], "resistances": [81000.0, 82000.0]}
+        st = select_target(cfg, entry_ref=80000.0, stop_dist=800.0,
+                           direction="short", sr=sr, atr_val=400.0)
+        self.assertEqual(st["target_source"], "atr_multiple")
+        # 兜底目标 = 80000 - 2.5*400 = 79000；RR = 1000/800 = 1.25
+        self.assertAlmostEqual(st["target"], 79000.0, places=6)
+        self.assertAlmostEqual(st["rr"], 1.25, places=6)
+        self.assertIsNone(st["nearest_note"])   # 无结构位，无需近位提示
+
+    def test_short_with_structure_uses_first_qualifying_support(self):
+        from okx_trader.risk import select_target
+        cfg = make_cfg()
+        # 空头目标：79000（近，RR=1000/800=1.25 < 1.5 过滤）、
+        # 78000（远，RR=2000/800=2.5 达标）
+        sr = {"supports": [79000.0, 78000.0], "resistances": []}
+        st = select_target(cfg, entry_ref=80000.0, stop_dist=800.0,
+                           direction="short", sr=sr, atr_val=400.0)
+        self.assertEqual(st["target_source"], "structure")
+        self.assertAlmostEqual(st["target"], 78000.0, places=6)
+        self.assertAlmostEqual(st["rr"], 2.5, places=6)
+
+    def test_long_unchanged(self):
+        from okx_trader.risk import select_target
+        cfg = make_cfg()
+        sr = {"supports": [], "resistances": [81200.0]}
+        st = select_target(cfg, entry_ref=80000.0, stop_dist=800.0,
+                           direction="long", sr=sr, atr_val=400.0)
+        self.assertEqual(st["target_source"], "structure")
+        self.assertAlmostEqual(st["target"], 81200.0, places=6)
+        self.assertAlmostEqual(st["rr"], 1.5, places=6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

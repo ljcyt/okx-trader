@@ -437,6 +437,12 @@ def format_factor_report(r):
         sup = ", ".join(f"{x:g}" for x in sr.get("supports", [])) or "无"
         res = ", ".join(f"{x:g}" for x in sr.get("resistances", [])) or "无"
         lines.append(f"  支撑位（近→远）：{sup}；阻力位（近→远）：{res}")
+    # 结构位缺失的一侧：目标仍可度量（R7 用 ATR 兜底目标），
+    # 明确写出，避免裁判把"无支撑"读成"RR 无法定义"而系统性否决空头
+    if not sr.get("supports"):
+        lines.append("  支撑位缺失：空头目标以 ATR 倍数兜底度量（非结构位）")
+    if not sr.get("resistances"):
+        lines.append("  阻力位缺失：多头目标以 ATR 倍数兜底度量（非结构位）")
     if r.get("fvg"):
         gaps = "；".join(
             f"{'看涨' if g['dir']=='bull' else '看跌'}缺口 {g['low']:g}~{g['high']:g}"
