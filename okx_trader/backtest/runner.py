@@ -56,6 +56,8 @@ def run_backtest(cfg, candles, *, bar="1H", fill_model="touch",
     cfg.LLM_API_BASE = ""
     cfg.ORDER_TIMEOUT_SEC = 0
     cfg.COLLECT_FACTORS = bool(collect_factors)
+    # 回测必须静默告警：几千轮 round_done/order_filled 会刷爆飞书 webhook
+    cfg.ALERT_WEBHOOK_URL = ""
 
     store = store or Store(db_path=os.path.join(
         tempfile.mkdtemp(prefix="okxbt-"), "bt.db"))
