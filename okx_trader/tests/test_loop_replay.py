@@ -127,10 +127,9 @@ class TradeLifecycleTest(unittest.TestCase):
         rw2 = w.RoundWriter.open(loop.store, "round_2", 2.0, "replay", 1, "baseline")
         snap = snap_for(loop)
         future = self._trade(loop.store)["opened_ts"]
-        # 模拟时间前进 3 根 K 线
-        with mock.patch("okx_trader.exits.time.time",
-                        return_value=future + 3 * 3600):
-            manage_open_positions(loop, snap, rw2)
+        # 模拟时间前进 3 根 K 线（虚拟时钟注入，替换旧的对 exits.time.time 打补丁）
+        loop._clock = lambda: future + 3 * 3600
+        manage_open_positions(loop, snap, rw2)
         tr = self._trade(loop.store)
         self.assertEqual(tr["status"], "closed")
         self.assertEqual(tr["exit_reason"], "time_stop")

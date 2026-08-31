@@ -12,7 +12,8 @@ import time
 
 
 class ReplayClient:
-    def __init__(self, cfg, logger=None, candles=None, script=None):
+    def __init__(self, cfg, logger=None, candles=None, script=None,
+                 fill_model="touch"):
         import logging
         from .config import get_logger
         self.cfg = cfg
@@ -22,6 +23,7 @@ class ReplayClient:
         self.candles = candles or {s: self._synth(s) for s in self.symbols}
         self.script = list(script or [])
         self.cursor = 0                      # 当前处于 script 的第几步
+        self.fill_model = fill_model         # touch | strict | always（无显式 fill 字段时生效）
         self.equity = float(getattr(cfg, "PAPER_EQUITY", 10000.0))
         self.positions = {}                  # inst → dict(direction, contracts, avg_px, stop, target)
         self.orders = {}                     # ord_id → dict(...)
@@ -33,25 +35,45 @@ class ReplayClient:
     # ── 游标 ──────────────────────────────────────────────────────
 
     def advance(self):
+        """推进一根 bar，并按该 bar 的 high/low 判定止损/止盈触发。
+
+        同一根 K 线内止损与止盈都在区间内时，一律判【止损先成交】——
+        这是保守约定（坏消息优先），回测不能乐观地假设止盈先到。
+        显式 sl_hit/tp_hit 字段优先于价格判定（兼容旧 3 步测试脚本）。
+        """
         self.cursor += 1
         step = self.current_step()
-        # SL/TP 触发判定：用本轮价格
         if step and self.positions:
-            px = float(step.get("price") or self._last_close())
+            px = float(step.get("price") or 0) or 0
+            high = float(step.get("high", px) or 0) or px
+            low = float(step.get("low", px) or 0) or px
             for inst in list(self.positions):
                 p = self.positions[inst]
-                if p["direction"] == "long" and (step.get("sl_hit") or px <= p["stop"]):
-                    self._close(inst, p["stop"], "stop")
-                elif p["direction"] == "long" and (step.get("tp_hit") or px >= p["target"]):
-                    self._close(inst, p["target"], "target")
-                elif p["direction"] == "short" and (step.get("sl_hit") or px >= p["stop"]):
-                    self._close(inst, p["stop"], "stop")
-                elif p["direction"] == "short" and (step.get("tp_hit") or px <= p["target"]):
-                    self._close(inst, p["target"], "target")
+                stop = p.get("stop") or 0
+                target = p.get("target")
+                if p["direction"] == "long":
+                    sl_hit = bool(step.get("sl_hit")) or (stop and low <= stop)
+                    tp_hit = bool(step.get("tp_hit")) or (target and high >= target)
+                else:  # short
+                    sl_hit = bool(step.get("sl_hit")) or (stop and high >= stop)
+                    tp_hit = bool(step.get("tp_hit")) or (target and low <= target)
+                # 同根 bar 双双触发 → 止损优先（保守）
+                if sl_hit:
+                    self._close(inst, stop, "stop")
+                elif tp_hit:
+                    self._close(inst, target, "target")
 
     def current_step(self):
         return self.script[self.cursor] if self.cursor < len(self.script) else \
             (self.script[-1] if self.script else {})
+
+    def now_ms(self):
+        """回测虚拟"当前时刻"（毫秒）：当前 bar 的 ts。供因子的断流守卫用，
+        避免历史 K 线被真实 wall-clock 误判为过期。"""
+        step = self.current_step()
+        if step and step.get("ts"):
+            return int(step["ts"])
+        return int(time.time() * 1000)
 
     def _close(self, inst, exit_px, reason):
         p = self.positions.pop(inst)
@@ -113,14 +135,22 @@ class ReplayClient:
 
     def get_candles(self, inst_id, bar="1H", limit=100, after=None):
         candles = list(self.candles.get(inst_id) or [])
-        # 追加当前轮的"最新已收盘"K线（随游标推进），保持价格路径与因子一致
-        px = self._last_close()
-        if px:
-            prev = candles[-1]["close"] if candles else px
-            candles = candles + [{"ts": candles[-1]["ts"] + 3600 * 1000,
-                                  "open": prev, "high": max(px, prev) + 10,
-                                  "low": min(px, prev) - 10, "close": px,
-                                  "vol": 1000.0}]
+        cur = self.current_step()
+        cur_ts = cur.get("ts") if cur else None
+        if cur_ts:
+            # 回测（真实 K 线带 ts）：前视保护——只返回严格早于当前步的已收盘
+            # bar，决策绝不偷看决定成交/止损的那根 bar
+            candles = [c for c in candles if c["ts"] < cur_ts]
+        else:
+            # 测试脚本（无 ts）：追加"当前收盘"合成 bar，保持因子价格与脚本一致
+            px = self._last_close()
+            if px:
+                prev = candles[-1]["close"] if candles else px
+                base_ts = candles[-1]["ts"] if candles else 0
+                candles = candles + [{"ts": base_ts + 3600 * 1000,
+                                      "open": prev, "high": max(px, prev) + 10,
+                                      "low": min(px, prev) - 10, "close": px,
+                                      "vol": 1000.0}]
         return candles[-int(limit):]
 
     def get_instrument(self, inst_id, refresh=False):
@@ -193,6 +223,29 @@ class ReplayClient:
             px = ref * (1 - ratio) if side == "buy" else ref * (1 + ratio)
         return self.round_price(px, self.get_instrument(inst_id)["tickSz"])
 
+    def _should_fill(self, inst_id, step, side, px):
+        """成交判定。step 显式带 fill 字段时用该值（旧 3 步测试脚本）；
+        否则按 fill_model：
+          always —— 挂即成交（最乐观，仅测试对齐）
+          touch  —— 当根 bar 的 low<=px（买）/high>=px（卖）则成交（默认，乐观）
+          strict —— 需 bar 极值穿过 px 至少 1 个 tickSz（略保守）
+        """
+        if "fill" in step:
+            return bool(step["fill"])
+        model = self.fill_model
+        if model == "always":
+            return True
+        px = float(px)
+        high = float(step.get("high", step.get("price", px)) or px)
+        low = float(step.get("low", step.get("price", px)) or px)
+        if model == "strict":
+            tick = self.get_instrument(inst_id)["tickSz"]
+            high -= tick
+            low += tick
+        if side == "buy":
+            return low <= px
+        return high >= px
+
     def place_maker_limit(self, inst_id, side, contracts, px=None,
                           price_offset_ratio=None, cl_ord_id="", reduce_only=False):
         step = self.current_step()
@@ -200,17 +253,20 @@ class ReplayClient:
                               price_offset_ratio=price_offset_ratio)
         self._seq += 1
         ord_id = f"replay-ord-{self._seq}"
-        fill = bool(step.get("fill"))
+        fill = self._should_fill(inst_id, step, side, px)
+        # 成交模型下：touch/strict 未成交 → 当根收盘即撤（不留工作单跨轮）；
+        # 显式 fill=False 的测试脚本仍走 "live"（保留工作单补记的测试路径）
+        state = "filled" if fill else ("live" if "fill" in step else "canceled")
         self.orders[ord_id] = {
             "instId": inst_id, "ordId": ord_id, "side": side, "px": px,
-            "sz": contracts, "state": "filled" if fill else "live",
+            "sz": contracts, "state": state,
             "acc_fill_sz": contracts if fill else 0.0,
             "avg_px": px if fill else None,
         }
         if fill:
             self._open(inst_id, side, contracts, px)
         self.log.info("（回放）挂单 %s %s %s 张 @%s → %s",
-                      inst_id, side, contracts, px, self.orders[ord_id]["state"])
+                      inst_id, side, contracts, px, state)
         return ord_id
 
     def _open(self, inst_id, side, contracts, px):

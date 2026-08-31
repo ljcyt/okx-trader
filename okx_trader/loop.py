@@ -138,6 +138,10 @@ class TradingLoop:
         self.next_round_ts = None
         self.last_round_id = None
         self.current_step = None
+        # 虚拟时钟：回测注入固定时间源（见 backtest/runner.py），生产走真实时间。
+        # 交易路径上的时间戳（rounds.ts / trades.opened_ts / 时间止损的 held_bars
+        # 等）都读 self.now()，否则回测几分钟跑完几个月，时间止损恒不触发。
+        self._clock = time.time
         self._busy = False
         self._run_now = threading.Event()
         w.write_event(self.store, self.env.name, "env_switch",
@@ -145,6 +149,10 @@ class TradingLoop:
                       f"v{__version__}", level="info")
         self.log.info("== %s ==（executing=%s）交易循环就绪",
                       self.env.name, self.executing)
+
+    def now(self):
+        """交易路径的统一时间源（回测可注入虚拟时钟）。"""
+        return self._clock()
 
     def _wire_alert_hooks(self):
         """告警钩子只注册一次：飞书 webhook（可选）监听关键交易事件。"""
@@ -225,7 +233,7 @@ class TradingLoop:
             if f:
                 self.log.info("因子：%s", format_factor_report(f).replace("\n", " | "))
         return {
-            "ts": time.time(),
+            "ts": self.now(),
             "equity": equity,
             "usdt_avail": equity_info["usdt_avail"],
             "hwm": hwm,
@@ -265,14 +273,16 @@ class TradingLoop:
             # 2. 持仓巡检/对账（移动/时间止损已挪到 5 分钟 tick，见 risk_tick）
             self._patrol_positions(snap, rw)
             # 2.5 因子动物园：前向收益回填 + 本轮观测采集（都幂等，失败不影响交易）
-            try:
-                backfill_returns(self.store, self.client, bar=self.cfg.ATR_BAR)
-                for inst_id, f in snap["factors"].items():
-                    if f:
-                        collect_from_report(self.store, rw.pk, inst_id, f,
-                                            self.cfg.ATR_BAR)
-            except Exception:  # noqa: BLE001
-                self.log.debug("因子动物园采集/回填失败", exc_info=True)
+            # 回测可置 COLLECT_FACTORS=False 关闭（2 年 1H × 3 标的 ≈ 57 万行）
+            if getattr(self.cfg, "COLLECT_FACTORS", True):
+                try:
+                    backfill_returns(self.store, self.client, bar=self.cfg.ATR_BAR)
+                    for inst_id, f in snap["factors"].items():
+                        if f:
+                            collect_from_report(self.store, rw.pk, inst_id, f,
+                                                self.cfg.ATR_BAR)
+                except Exception:  # noqa: BLE001
+                    self.log.debug("因子动物园采集/回填失败", exc_info=True)
             # 因子快照全量入库
             for inst_id, f in snap["factors"].items():
                 rw.write_factors(
@@ -397,7 +407,8 @@ class TradingLoop:
                              "direction": verdict.sized["direction"],
                              "contracts": verdict.sized["contracts"],
                              "avg_px": out.get("execution", {}).get("avg_fill_px"),
-                             "stop": stop, "target": tp or None,
+                             "stop": verdict.sized.get("stop_loss"),
+                             "target": verdict.sized.get("target") or None,
                              "equity": (self.last_snapshot or {}).get("equity"),
                              "message": "成交，交易所保护单（止损/止盈）已挂"})
         except Exception as e:  # noqa: BLE001 —— 单轮失败不影响下一轮
@@ -518,7 +529,7 @@ class TradingLoop:
                 self.store.execute(
                     "UPDATE orders SET state='canceled', updated_ts=? "
                     "WHERE exch_ord_id=?",
-                    (time.time(), str(o["exch_ord_id"])))
+                    (self.now(), str(o["exch_ord_id"])))
                 w.write_event(self.store, self.env.name, "round_cleanup",
                               f"轮次异常结束，撤销残留入场单 "
                               f"{o['exch_ord_id'][:8]}…（{o['inst_id']}）",
@@ -655,7 +666,7 @@ class TradingLoop:
             self.risk.state.set_working_orders(working)
 
         # ── 工作单生命周期 ──
-        now = time.time()
+        now = self.now()
         requote = int(getattr(self.cfg, "REQUOTE_AGE_SEC", 900) or 900)
         for inst_id in list(working.keys()):
             wo = working[inst_id]
@@ -839,13 +850,21 @@ class TradingLoop:
 
         filled = order["acc_fill_sz"]
         if filled <= 0:
+            if order["state"] == "canceled":
+                # 回测成交模型：当根 bar 未触价 → 收盘撤单，本笔不成交，
+                # 不留工作单跨轮（touch/strict 的语义是"当根不成交即作废"）
+                execution["status"] = "no_fill"
+                execution["note"] = "maker not touched"
+                self.log.info("限价单未触价，收盘撤单（%s 模型）",
+                              getattr(self.client, "fill_model", "touch"))
+                return execution
             # 未成交：报价保留在工作面上覆盖整轮（挂单策略核心），
             # 超龄撤换与盘中成交补记由巡检（risk_tick / 下轮开头）处理
             working = self.risk.state.get_working_orders()
             working[inst_id] = {"ord_id": str(ord_id), "side": side,
                                 "px": order.get("px") or sized.get("entry_ref"),
                                 "sz": contracts,
-                                "placed_ts": time.time(),
+                                "placed_ts": self.now(),
                                 "stop": stop, "target": tp,
                                 "analyst": sized.get("analyst")}
             self.risk.state.set_working_orders(working)
@@ -1027,7 +1046,7 @@ class TradingLoop:
             self._evaluate_drawdown_ladder(tick_rw, equity=realized_eq,
                                            hwm=realized_hwm)
         if equity is not None and hwm is not None and dd is not None:
-            w.write_equity(self.store, self.env.name, time.time(),
+            w.write_equity(self.store, self.env.name, self.now(),
                            equity, hwm, dd, eq["usdt_avail"], None,
                            len(positions))
         # 面板读 last_snapshot——tick 把新鲜权益/持仓刷进去，否则两轮之间
@@ -1044,7 +1063,7 @@ class TradingLoop:
             self.last_snapshot["positions"] = positions
         ticks = int(self.store.state_get(self.env.name, "risk_ticks") or 0) + 1
         self.store.state_set(self.env.name, "risk_ticks", ticks)
-        self.store.state_set(self.env.name, "last_risk_tick_ts", time.time())
+        self.store.state_set(self.env.name, "last_risk_tick_ts", self.now())
 
     def _evaluate_drawdown_ladder(self, rw, equity, hwm):
         """回撤阶梯（升档立即生效；降档需回撤 < 当前档阈值 80%，防抖动）。

@@ -236,6 +236,70 @@ def cmd_compare(args):
     return 0
 
 
+def _parse_date(d):
+    import time as _t
+    return int(_t.mktime(_t.strptime(d, "%Y-%m-%d")) * 1000)
+
+
+def cmd_backtest_fetch(args):
+    """抓取历史 K 线到本地缓存（与回测解耦，可独立重试）。"""
+    import json as _json
+    from .backtest.data import fetch_history
+    from .config import get_logger
+    from .env import ENVS, make_client
+
+    cfg = _build_cfg(args)
+    log = get_logger(level=cfg.LOG_LEVEL)
+    cl = make_client(ENVS["demo"], cfg, logger=log)
+    start_ms = _parse_date(args.frm)
+    end_ms = _parse_date(args.to)
+    for inst in cfg.SYMBOLS:
+        rows = fetch_history(cl, inst, args.bar, start_ms, end_ms,
+                             cache_dir=args.cache_dir)
+        log.info("已抓取 %s %s：%d 根", inst, args.bar, len(rows))
+    return 0
+
+
+def cmd_backtest(args):
+    """在历史 K 线上回放确定性决策路径，输出统计与 exit_reason 分布。"""
+    import json as _json
+    import os
+    from .backtest.data import fetch_history
+    from .backtest.runner import run_backtest
+    from .backtest.report import format_report
+    from .config import get_logger
+    from .env import ENVS, make_client
+    from .store.db import Store
+
+    cfg = _build_cfg(args)
+    log = get_logger(level=cfg.LOG_LEVEL)
+    symbols = args.symbols.split(",") if args.symbols else cfg.SYMBOLS
+    cfg.SYMBOLS = symbols
+    cl = make_client(ENVS["demo"], cfg, logger=log)
+    start_ms = _parse_date(args.frm)
+    end_ms = _parse_date(args.to)
+
+    candles = {}
+    for inst in symbols:
+        rows = fetch_history(cl, inst, args.bar, start_ms, end_ms,
+                             cache_dir=args.cache_dir)
+        candles[inst] = rows
+        log.info("%s：%d 根 %s", inst, len(rows), args.bar)
+
+    store = Store(os.path.join(args.db_dir, "bt.db") if args.db_dir else
+                  os.path.join("okx_trader", "backtest", "bt.db"))
+    rep = run_backtest(cfg, candles, bar=args.bar, fill_model=args.fill_model,
+                       store=store, collect_factors=args.factors,
+                       progress=lambda done, total, trades:
+                       log.info("已处理 %d/%d 根，交易 %d 笔", done, total, trades))
+    print("\n" + format_report(rep))
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            _json.dump(rep, f, ensure_ascii=False, indent=1)
+        print(f"\nJSON 报告已写：{args.json}")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="okxt", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -282,6 +346,26 @@ def main(argv=None):
     p.add_argument("--env", choices=["replay"], default="replay")
     p.add_argument("--no-execute", action="store_true")
     p.set_defaults(fn=cmd_replay)
+
+    p = sub.add_parser("backtest-fetch", help="抓取历史 K 线到缓存")
+    p.add_argument("--from", dest="frm", required=True, help="起始日期 YYYY-MM-DD")
+    p.add_argument("--to", required=True, help="结束日期 YYYY-MM-DD")
+    p.add_argument("--bar", default="1H")
+    p.add_argument("--cache-dir", default=None)
+    p.set_defaults(fn=cmd_backtest_fetch)
+
+    p = sub.add_parser("backtest", help="历史 K 线回测")
+    p.add_argument("--from", dest="frm", required=True, help="起始日期 YYYY-MM-DD")
+    p.add_argument("--to", required=True, help="结束日期 YYYY-MM-DD")
+    p.add_argument("--bar", default="1H")
+    p.add_argument("--symbols", default=None, help="逗号分隔，默认 cfg.SYMBOLS")
+    p.add_argument("--fill-model", choices=["touch", "strict", "always"],
+                   default="touch")
+    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--db-dir", default=None, help="回测库目录，默认 backtest/bt.db")
+    p.add_argument("--factors", action="store_true", help="采集因子观测（默认关）")
+    p.add_argument("--json", default=None, help="结构化结果输出路径")
+    p.set_defaults(fn=cmd_backtest)
 
     args = parser.parse_args(argv)
     return args.fn(args)

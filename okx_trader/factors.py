@@ -302,10 +302,13 @@ def build_factor_report(cfg, client, inst_id):
     if len(candles) < 60:
         raise ValueError(f"{inst_id} K 线数量不足（{len(candles)} 根），无法计算因子")
     # 过期数据守卫：最新已收盘 K 线比 2×bar 还旧，说明行情断流或时钟异常——
-    # 静默拿过期数据算因子比直接报错更糟
+    # 静默拿过期数据算因子比直接报错更糟。回测的 ReplayClient 提供 now_ms()
+    # 返回虚拟当前时刻（历史 K 线相对它不过期），生产走真实 wall-clock。
     bar_sec = _bar_seconds(bar)
     if bar_sec and candles:
-        stale_ms = time.time() * 1000 - candles[-1]["ts"]
+        now_fn = getattr(client, "now_ms", None)
+        now_ms = now_fn() if callable(now_fn) else int(time.time() * 1000)
+        stale_ms = now_ms - candles[-1]["ts"]
         if stale_ms > 2 * bar_sec * 1000:
             raise ValueError(
                 f"{inst_id} 最新已收盘K线已过期 {stale_ms / 60000:.0f} 分钟"

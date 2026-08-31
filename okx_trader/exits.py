@@ -171,7 +171,7 @@ def manage_open_positions(loop, snap, rw):
         # ── 时间止损 ──
         opened_ts = (tr["opened_ts"] if tr else None) or _parse_ts(m.get("opened_at"))
         if opened_ts:
-            held_bars = (time.time() - opened_ts) / _bar_seconds(cfg.ATR_BAR)
+            held_bars = (loop.now() - opened_ts) / _bar_seconds(cfg.ATR_BAR)
             if held_bars >= cfg.MAX_HOLD_BARS and abs(r_now) < 0.3:
                 loop.log.warning("时间止损：%s 持有 %.1f 根、浮盈 %.2fR——市价平掉",
                                  inst, held_bars, r_now)
@@ -190,7 +190,7 @@ def manage_open_positions(loop, snap, rw):
                     if tr:
                         reconcile_trade(loop.store, tr, exit_px=mark,
                                         reason="time_stop", close_round_pk=rw.pk,
-                                        ct_val=ct)
+                                        ct_val=ct, closed_ts=loop.now())
                     meta_all.pop(inst, None)
                     changed_meta = True
                 except Exception as e:  # noqa: BLE001
@@ -226,7 +226,7 @@ def reconcile_closed_trade(loop, snap, rw, inst, meta):
             reason, exit_px = "stop", stop
     reconcile_trade(loop.store, tr, exit_px=exit_px, reason=reason,
                     close_round_pk=rw.pk,
-                    ct_val=tr["ct_val"])
+                    ct_val=tr["ct_val"], closed_ts=loop.now())
     w.write_event(loop.store, loop.env.name, "trade_closed",
                   f"{inst_id} 离场：{reason}，exit≈{exit_px:.4g}",
                   level="info", inst_id=inst_id, round_pk=rw.pk)
@@ -237,14 +237,16 @@ def reconcile_closed_trade(loop, snap, rw, inst, meta):
                  "message": f"出场 {exit_px:.4g}（{reason}）"})
 
 
-def reconcile_trade(store, tr, exit_px, reason, close_round_pk, ct_val):
+def reconcile_trade(store, tr, exit_px, reason, close_round_pk, ct_val,
+                    closed_ts=None):
     sign = 1 if tr["direction"] == "long" else -1
     pnl = sign * (exit_px - tr["entry_px"]) * tr["contracts"] * ct_val
     r_mult = (pnl / tr["risk_usdt"]) if tr["risk_usdt"] else None
     store.execute(
         "UPDATE trades SET closed_ts=?, exit_px=?, realized_pnl=?, r_multiple=?, "
         "exit_reason=?, close_round_pk=?, status='closed' WHERE id=?",
-        (time.time(), exit_px, pnl, r_mult, reason, close_round_pk, tr["id"]))
+        (time.time() if closed_ts is None else closed_ts,
+         exit_px, pnl, r_mult, reason, close_round_pk, tr["id"]))
 
 
 def _parse_ts(s):
@@ -270,7 +272,7 @@ def open_trade_row(loop, rw, sized, filled, avg_px, open_round_pk=None):
         "analyst, committee_score, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'open')",
         (loop.env.name, inst, sized["direction"],
          open_round_pk if open_round_pk is not None else rw.pk,
-         time.time(),
+         loop.now(),
          filled, ct, avg_px, sized.get("stop_loss"), sized.get("target"),
          sized.get("rr"), sized.get("risk_usdt"), sized.get("analyst"),
          sized.get("committee_score")))
