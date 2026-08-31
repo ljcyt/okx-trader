@@ -29,6 +29,17 @@ def make_loop(tmp_dir, env="paper"):
     """纸面模式 TradingLoop，SQLite 指向临时目录（不污染真实数据）。"""
     lp = loop_mod.TradingLoop(env_name=env,
                               store=Store(os.path.join(tmp_dir, "trader.db")))
+    # 不带 client 构造：默认 OKXClient 会打到真实网络。调用方替换
+    # lp.client 后必须同步 risk.client（见 OcoPatrolTest），否则
+    # _revalidate_orphan → get_ticker 走真实行情，结果随 ETH 价格漂移
+    return lp
+
+
+def swap_client(lp, client):
+    """替换 loop 的 client 并同步 risk/committee 引用（测试装配用）。"""
+    lp.client = client
+    lp.risk.client = client
+    lp.committee.client = client
     return lp
 
 
@@ -81,10 +92,13 @@ class FakeLiveClient:
     def __init__(self):
         self.log = logging.getLogger("test")
         self.place_calls = []
-        self._sl_results = []   # 每次 get_pending_stop_losses 的返回（队列）
+        # 固定返回（非一次性队列）：真实 client 每次查询都返回同一份
+        # 列表；pop 语义会让孤儿复核多出的那次调用"吃掉"下一次的脚本值，
+        # 把"漏查 oco 会叠加止损单"这条回归守卫遮掉
+        self._sl = []
 
     def queue_sl(self, result):
-        self._sl_results.append(result)
+        self._sl = result
 
     def get_pending_orders(self, inst_id=""):
         return []
@@ -94,7 +108,7 @@ class FakeLiveClient:
         return {"instId": inst_id, "ctVal": 0.1}
 
     def get_pending_stop_losses(self, inst_id=""):
-        return self._sl_results.pop(0) if self._sl_results else []
+        return self._sl
 
     def get_algo_order_details(self, algo_id):
         return None
@@ -147,7 +161,7 @@ class OcoPatrolTest(unittest.TestCase):
         lp.env = ENVS["demo"]
         lp.executing = True
         fake = FakeLiveClient()
-        lp.client = fake
+        swap_client(lp, fake)     # 同步 risk.client，否则复核打真实网络
         lp.risk.state.set_positions_meta({"ETH-USDT-SWAP": {
             "direction": "long", "stop": 2474.19, "target": 2590.62,
             "contracts": 25.61, "opened_at": "2026-08-28 23:00:00",
